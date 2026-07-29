@@ -2,7 +2,7 @@ import { spawn, ChildProcess } from 'child_process';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
-import LiveChannel, { ILiveChannel } from '../models/LiveChannel.js';
+import { findChannelById, setChannelError, claimChannelPosterIfEmpty, type LiveChannelRow } from '../db/liveChannels.js';
 import { io } from '../index.js';
 import { emitChannelError } from '../socket/handlers.js';
 
@@ -102,11 +102,7 @@ export function autoPosterPathFor(channelId: string): string {
 
 async function markChannelError(channelId: string, message: string): Promise<void> {
   try {
-    await LiveChannel.findByIdAndUpdate(channelId, {
-      status: 'error',
-      lastError: message,
-      liveHlsPath: '',
-    });
+    await setChannelError(channelId, message);
   } catch (e: any) {
     console.error(`[live:${channelId}] Failed to persist error state: ${e.message}`);
   }
@@ -118,8 +114,8 @@ async function markChannelError(channelId: string, message: string): Promise<voi
  * over loopback and fans it out into (a) a fragmented-MP4 recording tee and
  * (b) a multi-variant live HLS ladder under uploads/hls/live/{channelId}.
  */
-export function startLiveTranscode(channel: ILiveChannel, sessionId: string): ChildProcess {
-  const channelId = String(channel._id);
+export function startLiveTranscode(channel: LiveChannelRow, sessionId: string): ChildProcess {
+  const channelId = String(channel.id);
   const renditions = resolveRenditions();
   const segTime = Number(process.env.LIVE_HLS_SEGMENT_TIME) || 4;
   // DVR window: how far back a viewer can seek before segments roll off and
@@ -131,8 +127,11 @@ export function startLiveTranscode(channel: ILiveChannel, sessionId: string): Ch
   const dvrSeconds = Number(process.env.LIVE_HLS_DVR_SECONDS) || 180;
   const listSize = Math.max(6, Math.ceil(dvrSeconds / segTime));
   const rtmpPort = Number(process.env.RTMP_PORT) || 1935;
-  const rtmpApp = channel.rtmpApp || 'live';
-  const inputUrl = `rtmp://127.0.0.1:${rtmpPort}/${rtmpApp}/${channel.streamKey}`;
+  const rtmpApp = channel.rtmp_app || 'live';
+  // `channel` here always comes from `findChannelByStreamKey`, which explicitly
+  // selects `stream_key` (the default column list omits it) -- so it's present
+  // even though the shared `LiveChannelRow` type marks it optional.
+  const inputUrl = `rtmp://127.0.0.1:${rtmpPort}/${rtmpApp}/${channel.stream_key}`;
 
   // Recording target — one file per broadcast session
   const recordDir = storageDir('recordings', channelId);
@@ -340,9 +339,9 @@ export function captureChannelPosterIfMissing(channelId: string): void {
 
   void (async () => {
     try {
-      const current = await LiveChannel.findById(channelId).select('posterPath');
+      const current = await findChannelById(channelId);
       if (!current) return;
-      if (current.posterPath && current.posterPath.trim()) return; // already has one
+      if (current.poster_path && current.poster_path.trim()) return; // already has one
 
       const segment = await waitForFirstSegment(channelId, POSTER_WAIT_TIMEOUT_MS);
       if (!segment) {
@@ -357,16 +356,13 @@ export function captureChannelPosterIfMissing(channelId: string): void {
         throw new Error('ffmpeg produced an empty poster file');
       }
 
-      // Re-check against the DB, not the stale doc read above: an admin could
+      // Re-check against the DB, not the stale row read above: an admin could
       // have uploaded a real poster while we were waiting for the segment, and
-      // a manual poster always wins. The condition lives in the query so the
-      // check and the write are a single atomic operation.
-      const claim = await LiveChannel.updateOne(
-        { _id: channelId, $or: [{ posterPath: '' }, { posterPath: null }, { posterPath: { $exists: false } }] },
-        { $set: { posterPath: outPath } },
-      );
+      // a manual poster always wins. `claimChannelPosterIfEmpty` makes the
+      // check and the write a single atomic UPDATE ... WHERE.
+      const won = await claimChannelPosterIfEmpty(channelId, outPath);
 
-      if (claim.modifiedCount > 0) {
+      if (won) {
         log(channelId, `auto-captured poster → ${outPath}`);
       } else {
         // Someone else won the race. Drop our frame — this filename is only ever

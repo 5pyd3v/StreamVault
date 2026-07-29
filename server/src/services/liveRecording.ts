@@ -1,8 +1,8 @@
 import path from 'path';
 import fs from 'fs';
 import { v4 as uuidv4 } from 'uuid';
-import LiveChannel from '../models/LiveChannel.js';
-import Video from '../models/Video.js';
+import { findChannelById } from '../db/liveChannels.js';
+import { createVideo } from '../db/videos.js';
 import { startEncodingPipeline } from './encoder.js';
 import { storageDir, recordingPathFor } from './liveEncoder.js';
 
@@ -27,14 +27,14 @@ export async function handleRecordingFinished(channelId: string, sessionId: stri
   const recordingPath = recordingPathFor(channelId, sessionId);
 
   try {
-    const channel = await LiveChannel.findById(channelId);
+    const channel = await findChannelById(channelId);
     if (!channel) {
       log(channelId, 'Channel no longer exists — discarding recording');
       safeUnlink(recordingPath);
       return;
     }
 
-    if (!channel.recordEnabled) {
+    if (!channel.record_enabled) {
       log(channelId, 'recordEnabled=false — discarding recording');
       safeUnlink(recordingPath);
       return;
@@ -65,25 +65,25 @@ export async function handleRecordingFinished(channelId: string, sessionId: stri
     }
 
     const originalName = `${channel.slug}-${sessionId}.mp4`;
-    const video = await Video.create({
-      title:         `${channel.name} — Live Replay ${new Date().toLocaleString()}`,
-      description:   channel.description || '',
-      owner:         channel.owner,
+    const video = await createVideo({
+      title:           `${channel.name} — Live Replay ${new Date().toLocaleString()}`,
+      description:     channel.description || '',
+      ownerId:         channel.owner_id,
       originalName,
-      mimeType:      'video/mp4',
-      sizeBytes:     fs.statSync(finalPath).size,
-      originalPath:  finalPath,
-      status:        'processing',
-      sourceType:    'live-recording',
-      sourceChannel: channel._id,
-      tags:          [channel.category].filter(Boolean),
-      folder:        'live-replays',
+      mimeType:        'video/mp4',
+      sizeBytes:       fs.statSync(finalPath).size,
+      originalPath:    finalPath,
+      status:          'processing',
+      sourceType:      'live-recording',
+      sourceChannelId: channel.id,
+      tags:            [channel.category].filter(Boolean),
+      folder:          'live-replays',
     });
 
-    log(channelId, `📼 Live replay → Video ${video._id} (${recStat.size} bytes), starting encode`);
+    log(channelId, `📼 Live replay → Video ${video.id} (${recStat.size} bytes), starting encode`);
 
     // Non-blocking: same call signature the upload merge route uses
-    startEncodingPipeline(video._id.toString(), finalPath, channel.owner.toString());
+    startEncodingPipeline(String(video.id), finalPath, String(channel.owner_id));
   } catch (err: any) {
     console.error(`[live-recording:${channelId}] VOD handoff failed: ${err.message}`);
   }

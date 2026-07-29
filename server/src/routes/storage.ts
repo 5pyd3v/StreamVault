@@ -2,7 +2,7 @@ import express from 'express';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import Video from '../models/Video.js';
+import { storageStats, largestPublishedVideos } from '../db/videos.js';
 import { protect, requireAdmin, AuthRequest } from '../middleware/auth.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -17,6 +17,21 @@ function getUploadsDir(): string {
     : path.join(__dirname, '..', '..', 'uploads');
 }
 
+// Same disk-path -> /uploads/... conversion videos.ts does. It isn't shared
+// because the storage-base helper isn't either: each router keeps its own copy,
+// so this follows the pattern already in place rather than introducing a module.
+function toUrl(fsPath: string | undefined | null): string {
+  if (!fsPath) return '';
+  const base = getUploadsDir();
+  let rel: string;
+  if (path.isAbsolute(fsPath)) {
+    rel = path.relative(base, fsPath).replace(/\\/g, '/');
+  } else {
+    rel = fsPath.replace(/\\/g, '/');
+  }
+  return rel.startsWith('..') ? '' : `/uploads/${rel}`;
+}
+
 function dirSize(dirPath: string): number {
   if (!fs.existsSync(dirPath)) return 0;
   let total = 0;
@@ -29,15 +44,13 @@ function dirSize(dirPath: string): number {
 
 router.get('/stats', async (_req: AuthRequest, res) => {
   try {
-    const [agg] = await Video.aggregate([
-      { $group: { _id: null, totalSize: { $sum: '$sizeBytes' }, count: { $sum: 1 } } },
-    ]);
+    const { totalVideos, totalSizeBytes } = await storageStats();
 
     const diskUsed = dirSize(getUploadsDir());
 
     res.json({
-      totalVideos: agg?.count || 0,
-      totalSizeBytes: agg?.totalSize || 0,
+      totalVideos,
+      totalSizeBytes,
       diskUsedBytes: diskUsed,
       provider: process.env.STORAGE_PROVIDER || 'local',
     });
@@ -48,11 +61,18 @@ router.get('/stats', async (_req: AuthRequest, res) => {
 
 router.get('/largest', async (_req, res) => {
   try {
-    const videos = await Video.find({ status: 'published' })
-      .select('title sizeBytes thumbnailPath')
-      .sort('-sizeBytes')
-      .limit(10);
-    res.json(videos);
+    const rows = await largestPublishedVideos(10);
+    // The old response was raw Mongoose docs from `.select('title sizeBytes
+    // thumbnailPath')`, i.e. `_id` + those three camelCase fields — reproduced
+    // here from the snake_case columns. `thumbnailUrl` is added alongside (not
+    // instead of) `thumbnailPath`, so existing consumers are unaffected.
+    res.json(rows.map(row => ({
+      _id: String(row.id),
+      title: row.title,
+      sizeBytes: Number(row.size_bytes),
+      thumbnailPath: row.thumbnail_path,
+      thumbnailUrl: toUrl(row.thumbnail_path),
+    })));
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }

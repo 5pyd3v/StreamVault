@@ -1,8 +1,10 @@
 import express from 'express';
 import fs from 'fs';
-import User from '../models/User.js';
-import Video from '../models/Video.js';
-import UploadSession from '../models/UploadSession.js';
+import { listUsers, updateUserRoleActive, deleteUser, countUsers, toPublicUser } from '../db/users.js';
+import { videoStats, deleteVideo } from '../db/videos.js';
+import { countActiveSessions, deleteStaleSessions } from '../db/uploadSessions.js';
+import { pool } from '../db/pool.js';
+import type { RowDataPacket } from 'mysql2';
 import { protect, requireAdmin, AuthRequest } from '../middleware/auth.js';
 
 const router = express.Router();
@@ -12,7 +14,9 @@ router.use(protect, requireAdmin);
 // ── Users ─────────────────────────────────────────────────────────────────────
 router.get('/users', async (_req, res) => {
   try {
-    const users = await User.find().select('-password -otp -twoFactorSecret').sort('-createdAt');
+    // `toPublicUser` already strips password / twoFactorSecret / rememberTokens,
+    // matching the old `.select('-password -otp -twoFactorSecret')`.
+    const users = (await listUsers()).map(toPublicUser);
     res.json(users);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -25,13 +29,12 @@ router.patch('/users/:id', async (req: AuthRequest, res) => {
       return res.status(400).json({ error: 'Cannot modify own role' });
     }
     const { role, active } = req.body;
-    const user = await User.findByIdAndUpdate(
-      req.params.id,
-      { ...(role !== undefined && { role }), ...(active !== undefined && { active }) },
-      { new: true }
-    ).select('-password');
+    const user = await updateUserRoleActive(req.params.id, {
+      ...(role !== undefined && { role }),
+      ...(active !== undefined && { active }),
+    });
     if (!user) return res.status(404).json({ error: 'User not found' });
-    res.json(user);
+    res.json(toPublicUser(user));
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -42,7 +45,7 @@ router.delete('/users/:id', async (req: AuthRequest, res) => {
     if (req.params.id === req.user!._id.toString()) {
       return res.status(400).json({ error: 'Cannot delete own account' });
     }
-    await User.findByIdAndDelete(req.params.id);
+    await deleteUser(req.params.id);
     res.json({ message: 'User deleted' });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -52,14 +55,18 @@ router.delete('/users/:id', async (req: AuthRequest, res) => {
 // ── Platform stats ────────────────────────────────────────────────────────────
 router.get('/stats', async (_req, res) => {
   try {
-    const [users, videos, sessions] = await Promise.all([
-      User.countDocuments(),
-      Video.countDocuments(),
-      UploadSession.countDocuments({ status: 'active' }),
+    const [users, sessions, stats] = await Promise.all([
+      countUsers(),
+      countActiveSessions(),
+      videoStats(null), // null = every owner, admin-wide totals
     ]);
-    const failedJobs = await Video.countDocuments({ status: 'failed' });
-    const encodingJobs = await Video.countDocuments({ status: 'encoding' });
-    res.json({ users, videos, activeSessions: sessions, failedJobs, encodingJobs });
+    res.json({
+      users,
+      videos: stats.total,
+      activeSessions: sessions,
+      failedJobs: stats.byStatus['failed'] || 0,
+      encodingJobs: stats.byStatus['encoding'] || 0,
+    });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -68,19 +75,19 @@ router.get('/stats', async (_req, res) => {
 // ── Cleanup orphaned videos (missing files on disk) ──────────────────────────
 router.post('/cleanup', async (_req, res) => {
   try {
-    const videos = await Video.find();
+    const [rows] = await pool.query<RowDataPacket[]>('SELECT id, original_path, hls_path FROM videos');
     const orphans: string[] = [];
-    for (const v of videos) {
-      const hasOriginal = v.originalPath && fs.existsSync(v.originalPath);
-      const hasHls = v.hlsPath && fs.existsSync(v.hlsPath);
+    for (const v of rows) {
+      const hasOriginal = v.original_path && fs.existsSync(v.original_path);
+      const hasHls = v.hls_path && fs.existsSync(v.hls_path);
       if (!hasOriginal && !hasHls) {
-        orphans.push(v._id.toString());
-        await v.deleteOne();
+        orphans.push(String(v.id));
+        await deleteVideo(v.id);
       }
     }
     // Also purge stale upload sessions
-    const staleSessions = await UploadSession.deleteMany({ status: { $in: ['done', 'error'] } });
-    res.json({ removed: orphans.length, orphanIds: orphans, staleSessions: staleSessions.deletedCount });
+    const staleSessions = await deleteStaleSessions();
+    res.json({ removed: orphans.length, orphanIds: orphans, staleSessions });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }

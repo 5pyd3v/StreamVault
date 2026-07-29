@@ -2,7 +2,6 @@ import 'dotenv/config';
 import express from 'express';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
-import mongoose from 'mongoose';
 import cors from 'cors';
 import helmet from 'helmet';
 import morgan from 'morgan';
@@ -19,8 +18,11 @@ import storageRoutes from './routes/storage.js';
 import adminRoutes from './routes/admin.js';
 import liveRoutes from './routes/live.js';
 import { registerSocketHandlers } from './socket/handlers.js';
-import Video from './models/Video.js';
-import LiveChannel from './models/LiveChannel.js';
+import { testConnection } from './db/pool.js';
+import { findVideosByStatuses, updateVideo } from './db/videos.js';
+import { deleteVideoStreams } from './db/videoStreams.js';
+import { resetStuckLiveChannels } from './db/liveChannels.js';
+import { deleteExpiredSessions } from './db/uploadSessions.js';
 import { startEncodingPipeline } from './services/encoder.js';
 import { startLiveMediaServer } from './services/liveMediaServer.js';
 
@@ -89,10 +91,9 @@ app.use((err: any, _req: express.Request, res: express.Response, _next: express.
 });
 
 const PORT = Number(process.env.PORT) || 5001;
-const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/streamvault';
 
-mongoose.connect(MONGO_URI).then(async () => {
-  console.log('✅ MongoDB connected');
+testConnection().then(async () => {
+  console.log('✅ MySQL connected');
   httpServer.listen(PORT, () => console.log(`🚀 StreamVault API → http://localhost:${PORT}`));
 
   // RTMP ingest for OBS (transcoding + HLS output handled by our own ffmpeg pipeline)
@@ -104,34 +105,33 @@ mongoose.connect(MONGO_URI).then(async () => {
 
   // No broadcast can survive a restart — clear stale live state
   try {
-    await LiveChannel.updateMany(
-      { status: { $in: ['live', 'starting'] } },
-      { status: 'offline', currentSessionId: null, liveHlsPath: '', viewerCount: 0 }
-    );
+    await resetStuckLiveChannels();
   } catch (e: any) {
     console.error('Live channel reset error:', e.message);
   }
 
   // Resume any videos stuck in processing/encoding from a previous crashed run
   try {
-    const stuck = await Video.find({ status: { $in: ['processing', 'encoding'] } });
+    const stuck = await findVideosByStatuses(['processing', 'encoding']);
     for (const v of stuck) {
-      if (v.originalPath && fs.existsSync(v.originalPath)) {
-        console.log(`♻️  Resuming stuck encode: ${v._id}`);
-        v.encodingProgress = 0;
-        v.encodingStage = 'Resuming after restart';
-        v.encodingError = undefined;
-        v.streams = [] as any;
-        await v.save();
-        startEncodingPipeline(v._id.toString(), v.originalPath, v.owner.toString());
+      const videoId = String(v.id);
+      if (v.original_path && fs.existsSync(v.original_path)) {
+        console.log(`♻️  Resuming stuck encode: ${videoId}`);
+        await deleteVideoStreams(videoId);
+        await updateVideo(videoId, { encodingProgress: 0, encodingStage: 'Resuming after restart', encodingError: null });
+        startEncodingPipeline(videoId, v.original_path, String(v.owner_id));
       } else {
-        console.warn(`⚠️  Marking as failed (source missing): ${v._id}`);
-        v.status = 'failed';
-        v.encodingError = 'Source file missing after server restart';
-        await v.save();
+        console.warn(`⚠️  Marking as failed (source missing): ${videoId}`);
+        await updateVideo(videoId, { status: 'failed', encodingError: 'Source file missing after server restart' });
       }
     }
   } catch (e: any) {
     console.error('Resume-stuck error:', e.message);
   }
-}).catch(err => { console.error('❌ MongoDB failed:', err.message); process.exit(1); });
+
+  // MongoDB had a TTL index auto-deleting expired upload sessions; MySQL has no
+  // equivalent, so run the same cleanup on a timer instead.
+  setInterval(() => {
+    deleteExpiredSessions().catch(e => console.error('Expired-session cleanup error:', e.message));
+  }, 60 * 60 * 1000).unref();
+}).catch(err => { console.error('❌ MySQL failed:', err.message); process.exit(1); });

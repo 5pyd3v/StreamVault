@@ -2,7 +2,18 @@ import express from 'express';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import Video from '../models/Video.js';
+import {
+  listVideos,
+  getApiVideo,
+  toApiVideo,
+  findVideoById,
+  findVideoByIdWithOwner,
+  updateVideo,
+  incrementViews,
+  deleteVideo,
+  videoStats,
+  type VideoPatch,
+} from '../db/videos.js';
 import { protect, requireEditor, AuthRequest } from '../middleware/auth.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -57,23 +68,29 @@ const router = express.Router();
 //
 // The `status` query param is honoured for admins only; a non-admin asking for
 // `?status=failed` still gets published-only rather than overriding the filter.
+// `listVideos` owns that rule now, together with the folder filter, the search
+// replacement for Mongo's `$text`, and safe pagination.
+//
+// Streams are deliberately not loaded per row: they live in their own table now,
+// so fetching them would cost an extra query per video, and nothing that consumes
+// the list response reads `streams` — only the single-video endpoint does.
 router.get('/', protect, async (req: AuthRequest, res) => {
   try {
     const { status, search, folder, page = 1, limit = 50, sort = '-createdAt' } = req.query;
     const isAdmin = req.user!.role === 'admin';
-    const query: any = isAdmin ? {} : { status: 'published' };
-    if (isAdmin && status && status !== 'all') query.status = status;
-    if (folder) query.folder = folder;
-    if (search) query.$text = { $search: String(search) };
 
-    const videos = await Video.find(query)
-      .sort(String(sort))
-      .skip((Number(page) - 1) * Number(limit))
-      .limit(Number(limit))
-      .populate('owner', 'name email');
+    const { rows, total } = await listVideos({
+      status: status !== undefined ? String(status) : undefined,
+      isAdmin,
+      search: search ? String(search) : undefined,
+      folder: folder ? String(folder) : undefined,
+      page: Number(page),
+      limit: Number(limit),
+      sort: String(sort),
+    });
 
-    const total = await Video.countDocuments(query);
-    res.json({ videos: videos.map(addUrls), total, page: Number(page), pages: Math.ceil(total / Number(limit)) });
+    const videos = rows.map(row => addUrls(toApiVideo(row)));
+    res.json({ videos, total, page: Number(page), pages: Math.ceil(total / Number(limit)) });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -85,15 +102,17 @@ router.get('/', protect, async (req: AuthRequest, res) => {
 // own. Anything still draft/processing/failed/archived stays admin-or-owner only.
 router.get('/:id', protect, async (req: AuthRequest, res) => {
   try {
-    const video = await Video.findById(req.params.id).populate('owner', 'name email');
+    const video = await getApiVideo(req.params.id);
     if (!video) return res.status(404).json({ error: 'Video not found' });
     const isAdmin = req.user!.role === 'admin';
-    const isOwner = video.owner._id.toString() === req.user!._id.toString();
+    // Both sides are already plain strings (the shaping stringifies owner._id).
+    const isOwner = video.owner._id === req.user!._id;
     if (!isAdmin && !isOwner && video.status !== 'published') {
       return res.status(403).json({ error: 'Forbidden' });
     }
+    await incrementViews(req.params.id);
+    // Reflect the bump in this response too, as the old read-modify-save did.
     video.views += 1;
-    await video.save();
     res.json(addUrls(video));
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -104,18 +123,25 @@ router.get('/:id', protect, async (req: AuthRequest, res) => {
 router.patch('/:id', protect, requireEditor, async (req: AuthRequest, res) => {
   try {
     const { title, description, tags, folder, status } = req.body;
-    const video = await Video.findById(req.params.id);
+    const video = await findVideoByIdWithOwner(req.params.id);
     if (!video) return res.status(404).json({ error: 'Video not found' });
-    if (req.user!.role !== 'admin' && video.owner.toString() !== req.user!._id.toString()) {
+    // Raw row: `owner_id` is a number, so stringify it before comparing.
+    if (req.user!.role !== 'admin' && String(video.owner_id) !== req.user!._id) {
       return res.status(403).json({ error: 'Forbidden' });
     }
-    if (title !== undefined) video.title = title;
-    if (description !== undefined) video.description = description;
-    if (tags !== undefined) video.tags = tags;
-    if (folder !== undefined) video.folder = folder;
-    if (status !== undefined && ['draft','archived'].includes(status)) video.status = status;
-    await video.save();
-    res.json(addUrls(video));
+
+    // Only the keys actually supplied get written; omitted ones keep their value,
+    // matching the old assign-only-if-defined-then-save behaviour.
+    const patch: VideoPatch = {};
+    if (title !== undefined) patch.title = title;
+    if (description !== undefined) patch.description = description;
+    if (tags !== undefined) patch.tags = tags;
+    if (folder !== undefined) patch.folder = folder;
+    if (status !== undefined && ['draft', 'archived'].includes(status)) patch.status = status;
+    await updateVideo(req.params.id, patch);
+
+    const updated = await getApiVideo(req.params.id);
+    res.json(addUrls(updated));
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -124,19 +150,19 @@ router.patch('/:id', protect, requireEditor, async (req: AuthRequest, res) => {
 // ── Delete video ──────────────────────────────────────────────────────────────
 router.delete('/:id', protect, requireEditor, async (req: AuthRequest, res) => {
   try {
-    const video = await Video.findById(req.params.id);
+    const video = await findVideoById(req.params.id);
     if (!video) return res.status(404).json({ error: 'Not found' });
-    if (req.user!.role !== 'admin' && video.owner.toString() !== req.user!._id.toString()) {
+    if (req.user!.role !== 'admin' && String(video.owner_id) !== req.user!._id) {
       return res.status(403).json({ error: 'Forbidden' });
     }
 
     // Clean up files from disk (best-effort, non-blocking)
     const base = storageBase();
     const toDelete: string[] = [];
-    if (video.originalPath) toDelete.push(video.originalPath);
-    if (video.thumbnailPath) toDelete.push(video.thumbnailPath);
+    if (video.original_path) toDelete.push(video.original_path);
+    if (video.thumbnail_path) toDelete.push(video.thumbnail_path);
     // HLS directory: base/hls/{videoId}
-    toDelete.push(path.join(base, 'hls', video._id.toString()));
+    toDelete.push(path.join(base, 'hls', String(video.id)));
     for (const p of toDelete) {
       try {
         if (fs.existsSync(p)) {
@@ -146,7 +172,7 @@ router.delete('/:id', protect, requireEditor, async (req: AuthRequest, res) => {
       } catch { /* ignore individual cleanup failures */ }
     }
 
-    await video.deleteOne();
+    await deleteVideo(req.params.id); // video_streams rows cascade via FK
     res.json({ message: 'Video deleted' });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -156,18 +182,11 @@ router.delete('/:id', protect, requireEditor, async (req: AuthRequest, res) => {
 // ── Stats ─────────────────────────────────────────────────────────────────────
 router.get('/meta/stats', protect, async (req: AuthRequest, res) => {
   try {
-    const match = req.user!.role === 'admin' ? {} : { owner: req.user!._id };
-    const [agg] = await Video.aggregate([
-      { $match: match },
-      { $group: {
-        _id: null,
-        total: { $sum: 1 },
-        totalSize: { $sum: '$sizeBytes' },
-        totalViews: { $sum: '$views' },
-        byStatus: { $push: '$status' },
-      }},
-    ]);
-    res.json(agg || { total: 0, totalSize: 0, totalViews: 0 });
+    const isAdmin = req.user!.role === 'admin';
+    // Already returns zeros when nothing matches, so the old `|| {…}` fallback
+    // has nothing left to guard against.
+    const stats = await videoStats(isAdmin ? null : Number(req.user!._id));
+    res.json(stats);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }

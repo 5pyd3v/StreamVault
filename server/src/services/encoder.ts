@@ -1,11 +1,14 @@
 import ffmpeg from 'fluent-ffmpeg';
+import { spawn, ChildProcess } from 'child_process';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
-import Video from '../models/Video.js';
-import type { IVideoStream } from '../models/Video.js';
 import { io } from '../index.js';
 import { emitEncodingProgress, emitEncodingDone, emitEncodingError } from '../socket/handlers.js';
+import {
+  findVideoById, updateVideo, appendEncodingLog, markVideoFailed, getApiVideo,
+} from '../db/videos.js';
+import { addVideoStream } from '../db/videoStreams.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -18,10 +21,15 @@ function storageDir(...parts: string[]): string {
 
 const HLS_BASE = storageDir('hls');
 const THUMB_BASE = storageDir('thumbnails');
+const FFMPEG_BIN = process.env.FFMPEG_PATH || 'ffmpeg';
 
 if (process.env.FFMPEG_PATH) ffmpeg.setFfmpegPath(process.env.FFMPEG_PATH);
 if (process.env.FFPROBE_PATH) ffmpeg.setFfprobePath(process.env.FFPROBE_PATH);
 
+// How many different *videos* may encode at once, server-wide. This is now
+// the only concurrency knob that matters: since a single video's renditions
+// all encode in one ffmpeg process (see below), the old per-rendition
+// concurrency limiter has nothing left to bound.
 const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT_JOBS) || 4;
 let activeJobs = 0;
 const jobQueue: Array<() => void> = [];
@@ -41,59 +49,6 @@ function releaseSlot(): void {
   activeJobs--;
   const next = jobQueue.shift();
   if (next) next();
-}
-
-// How many renditions of a SINGLE video may be worked on at the same time.
-// Worst case parallel ffmpeg processes = MAX_CONCURRENT_JOBS * RENDITION_CONCURRENCY.
-const RENDITION_CONCURRENCY = Math.max(1, Number(process.env.ENCODE_PARALLEL_RENDITIONS) || 2);
-
-/**
- * Run `worker` over `items` with at most `limit` in flight at once.
- * On the first failure no further items are started; already in-flight items are
- * awaited (so no ffmpeg process is orphaned) and the first error is re-thrown.
- */
-async function mapWithConcurrency<T>(
-  items: T[],
-  limit: number,
-  worker: (item: T, index: number) => Promise<void>
-): Promise<void> {
-  const total = items.length;
-  if (total === 0) return;
-
-  let nextIndex = 0;
-  let firstError: any = null;
-  const poolSize = Math.max(1, Math.min(limit, total));
-
-  const runner = async (): Promise<void> => {
-    while (true) {
-      if (firstError) return;
-      const index = nextIndex++;
-      if (index >= total) return;
-      try {
-        await worker(items[index], index);
-      } catch (err) {
-        if (!firstError) firstError = err;
-        return;
-      }
-    }
-  };
-
-  await Promise.all(Array.from({ length: poolSize }, () => runner()));
-  if (firstError) throw firstError;
-}
-
-/**
- * Tiny async mutex: serializes the critical sections that mutate + save the
- * shared Mongoose document, so concurrent renditions can't lose each other's
- * updates. Never call a locked function from inside another locked section.
- */
-function createMutex(): <T>(fn: () => Promise<T>) => Promise<T> {
-  let tail: Promise<unknown> = Promise.resolve();
-  return <T>(fn: () => Promise<T>): Promise<T> => {
-    const result = tail.then(fn, fn);
-    tail = result.catch(() => undefined);
-    return result;
-  };
 }
 
 // Quality presets - only encode up to source resolution
@@ -167,40 +122,200 @@ async function generateThumbnails(
   return results;
 }
 
+// ── Hardware-accelerated, single-decode multi-output encoding ─────────────────
+//
+// The old pipeline ran one whole separate ffmpeg process PER quality rendition,
+// each one independently re-decoding the entire source video from scratch --
+// for a 4-rung 1080p job that's 4x redundant decoding before any encoding even
+// starts, almost certainly the dominant cost behind multi-hour encode times.
+// This redesign mirrors the single-process multi-output architecture already
+// proven in services/liveEncoder.ts: one input, one decode, N encode branches
+// via `-filter_complex split`, each branch its own `-map`/output. Hardware
+// encoding (NVENC preferred, QSV/AMF as alternates) is attempted first when
+// available, with automatic fallback to software libx264 if the hardware path
+// fails to come up (wrong GPU vendor / missing driver in production vs. here).
+
+type EncoderBackend = 'nvenc' | 'qsv' | 'amf' | 'software';
+
+let cachedEncoderCaps: Set<string> | null = null;
+
+/** Probes the ffmpeg *binary* (not the runtime GPU) once, cached for the process lifetime. */
+async function probeAvailableEncoders(): Promise<Set<string>> {
+  if (cachedEncoderCaps) return cachedEncoderCaps;
+  return new Promise(resolve => {
+    let out = '';
+    const proc = spawn(FFMPEG_BIN, ['-hide_banner', '-encoders'], { windowsHide: true });
+    proc.stdout?.on('data', (d: Buffer) => { out += d.toString(); });
+    proc.on('close', () => {
+      const caps = new Set<string>();
+      for (const enc of ['h264_nvenc', 'h264_qsv', 'h264_amf']) if (out.includes(enc)) caps.add(enc);
+      cachedEncoderCaps = caps;
+      resolve(caps);
+    });
+    proc.on('error', () => { cachedEncoderCaps = new Set(); resolve(cachedEncoderCaps); });
+  });
+}
+
+async function resolveEncoderBackend(): Promise<EncoderBackend> {
+  const configured = (process.env.ENCODER_HWACCEL || 'auto').toLowerCase();
+  if (configured === 'software' || configured === 'none') return 'software';
+  if (configured === 'nvenc' || configured === 'qsv' || configured === 'amf') return configured;
+  const caps = await probeAvailableEncoders();
+  if (caps.has('h264_nvenc')) return 'nvenc';
+  if (caps.has('h264_qsv')) return 'qsv';
+  if (caps.has('h264_amf')) return 'amf';
+  return 'software';
+}
+
+function parseKbps(bitrateStr: string): number {
+  return parseInt(bitrateStr, 10) || 0;
+}
+
+function buildEncodeArgs(
+  inputPath: string,
+  outputPaths: Record<string, string>,
+  qualities: typeof QUALITIES,
+  backend: EncoderBackend
+): string[] {
+  const args: string[] = ['-hide_banner', '-loglevel', 'warning', '-y'];
+  // Hardware decode is only wired up for the NVENC/CUDA path -- QSV/AMF hwaccel
+  // decode flags vary too much by platform/driver to safely auto-enable, and
+  // encode-side hardware acceleration alone (still used for those backends
+  // below) already captures most of the win.
+  if (backend === 'nvenc') args.push('-hwaccel', 'cuda');
+  args.push('-i', inputPath);
+
+  const splitOutputs = qualities.map((_, k) => `[s${k}]`).join('');
+  const chains = qualities.map((q, k) => {
+    const [w, h] = q.scale.split(':');
+    return `[s${k}]scale=w=${w}:h=${h}:force_original_aspect_ratio=decrease,` +
+           `pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:color=black,scale=trunc(iw/2)*2:trunc(ih/2)*2[v${k}]`;
+  });
+  args.push('-filter_complex', `[0:v]split=${qualities.length}${splitOutputs};${chains.join(';')}`);
+
+  for (let i = 0; i < qualities.length; i++) {
+    const q = qualities[i];
+    const kbps = parseKbps(q.bitrate);
+    const maxrate = `${Math.round(kbps * 1.1)}k`;
+    const bufsize = `${Math.round(kbps * 2)}k`;
+
+    args.push('-map', `[v${i}]`, '-map', '0:a:0?');
+
+    if (backend === 'nvenc') {
+      args.push(
+        '-c:v', 'h264_nvenc',
+        '-preset', process.env.ENCODER_NVENC_PRESET || 'p4',
+        '-rc', 'vbr', '-b:v', q.bitrate, '-maxrate', maxrate, '-bufsize', bufsize,
+      );
+    } else if (backend === 'qsv') {
+      args.push('-c:v', 'h264_qsv', '-preset', 'veryfast', '-b:v', q.bitrate, '-maxrate', maxrate);
+    } else if (backend === 'amf') {
+      args.push('-c:v', 'h264_amf', '-quality', 'speed', '-b:v', q.bitrate, '-maxrate', maxrate);
+    } else {
+      args.push(
+        '-c:v', 'libx264',
+        '-preset', process.env.ENCODER_SOFTWARE_PRESET || 'superfast',
+        '-crf', '23', '-b:v', q.bitrate,
+      );
+    }
+
+    args.push(
+      '-c:a', 'aac', '-b:a', q.audioBitrate,
+      '-pix_fmt', 'yuv420p', '-movflags', '+faststart',
+      outputPaths[q.name],
+    );
+  }
+
+  return args;
+}
+
+interface EncodeAllOptions {
+  videoDurationSec: number;
+  onProgress: (pct: number) => void;
+}
+
+/** Spawns one multi-output ffmpeg process, returns once every output file exists and is non-empty. */
+function spawnEncodeAttempt(
+  inputPath: string,
+  outputPaths: Record<string, string>,
+  qualities: typeof QUALITIES,
+  backend: EncoderBackend,
+  opts: EncodeAllOptions
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const args = buildEncodeArgs(inputPath, outputPaths, qualities, backend);
+    const proc = spawn(FFMPEG_BIN, args, { windowsHide: true });
+    const startedAt = Date.now();
+    let stderrTail = '';
+
+    proc.stderr?.on('data', (chunk: Buffer) => {
+      const text = chunk.toString();
+      stderrTail = (stderrTail + text).slice(-2000);
+      // ffmpeg prints one "time=HH:MM:SS.xx" progress line periodically,
+      // reflecting the shared decode timeline all output branches ride on --
+      // one combined percentage is now correct instead of N independently
+      // tracked ones, since every rendition finishes together.
+      const m = text.match(/time=(\d+):(\d+):(\d+\.\d+)/);
+      if (m && opts.videoDurationSec > 0) {
+        const seconds = Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]);
+        opts.onProgress(Math.min(100, (seconds / opts.videoDurationSec) * 100));
+      }
+    });
+
+    proc.on('error', (err: Error) => {
+      reject(new Error(`ffmpeg (${backend}) spawn failed: ${err.message}`));
+    });
+
+    proc.on('close', (code, signal) => {
+      const elapsed = Date.now() - startedAt;
+      const allProduced = qualities.every(q => {
+        const p = outputPaths[q.name];
+        return fs.existsSync(p) && fs.statSync(p).size > 0;
+      });
+      if (code === 0 && allProduced) {
+        resolve();
+        return;
+      }
+      // A near-instant non-zero exit (or a zero exit with no real output)
+      // means the hardware path never actually came up -- the caller retries
+      // with software instead of failing the whole job.
+      reject(new Error(
+        `ffmpeg (${backend}) exited code=${code} signal=${signal} after ${Math.round(elapsed / 1000)}s ` +
+        `(allOutputsProduced=${allProduced}). Stderr: ${stderrTail.slice(-500)}`
+      ));
+    });
+  });
+}
+
 /**
- * Encode a single quality rendition
+ * Encodes every applicable quality rendition in ONE ffmpeg process (one
+ * decode, N encode branches). Tries the resolved hardware backend first; on
+ * any failure, automatically retries once with software libx264 so a
+ * hardware/driver mismatch degrades to "slow but working" instead of failing
+ * the job outright.
  */
-async function encodeRendition(
+async function encodeAllRenditions(
+  videoId: string,
   inputPath: string,
   outputDir: string,
-  quality: typeof QUALITIES[0],
+  qualities: typeof QUALITIES,
+  videoDurationSec: number,
   onProgress: (pct: number) => void
-): Promise<string> {
-  const outputPath = path.join(outputDir, `${quality.name}.mp4`);
-  const [w, h] = quality.scale.split(':').map(Number);
-  return new Promise((resolve, reject) => {
-    let stderr = '';
-    ffmpeg(inputPath)
-      .videoCodec('libx264')
-      .audioCodec('aac')
-      .videoBitrate(quality.bitrate)
-      .audioBitrate(quality.audioBitrate)
-      // Scale, keep aspect ratio, and force even dimensions (required by libx264)
-      .videoFilters(`scale=w=${w}:h=${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:color=black,scale=trunc(iw/2)*2:trunc(ih/2)*2`)
-      .outputOptions(['-preset', 'veryfast', '-crf', '23', '-movflags', '+faststart', '-pix_fmt', 'yuv420p'])
-      .output(outputPath)
-      .on('stderr', line => { stderr += line + '\n'; })
-      .on('progress', p => onProgress(p.percent || 0))
-      .on('end', () => {
-        if (fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
-          resolve(outputPath);
-        } else {
-          reject(new Error(`Encoding ${quality.name} produced empty file. Stderr: ${stderr.slice(-500)}`));
-        }
-      })
-      .on('error', (err) => reject(new Error(`Encoding ${quality.name}: ${err.message}. Stderr: ${stderr.slice(-500)}`)))
-      .run();
-  });
+): Promise<Record<string, string>> {
+  const outputPaths: Record<string, string> = {};
+  for (const q of qualities) outputPaths[q.name] = path.join(outputDir, `${q.name}.mp4`);
+
+  const backend = await resolveEncoderBackend();
+  try {
+    log(videoId, `encoding ${qualities.map(q => q.name).join('+')} via ${backend} (single pass)`);
+    await spawnEncodeAttempt(inputPath, outputPaths, qualities, backend, { videoDurationSec, onProgress });
+    return outputPaths;
+  } catch (err: any) {
+    if (backend === 'software') throw err; // already the fallback -- nothing left to try
+    log(videoId, `⚠️  hardware encode (${backend}) failed, falling back to software: ${err.message}`);
+    await spawnEncodeAttempt(inputPath, outputPaths, qualities, 'software', { videoDurationSec, onProgress });
+    return outputPaths;
+  }
 }
 
 /**
@@ -256,6 +371,39 @@ async function generateHLS(
 }
 
 /**
+ * Run `worker` over `items` with at most `limit` in flight at once. Still used
+ * for stage 4 (HLS segmentation), which is cheap per-rendition stream-copy
+ * work independent of the encode stage above.
+ */
+async function mapWithConcurrency<T>(
+  items: T[],
+  limit: number,
+  worker: (item: T, index: number) => Promise<void>
+): Promise<void> {
+  const total = items.length;
+  if (total === 0) return;
+  let nextIndex = 0;
+  let firstError: any = null;
+  const poolSize = Math.max(1, Math.min(limit, total));
+  const runner = async (): Promise<void> => {
+    while (true) {
+      if (firstError) return;
+      const index = nextIndex++;
+      if (index >= total) return;
+      try {
+        await worker(items[index], index);
+      } catch (err) {
+        if (!firstError) firstError = err;
+        return;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: poolSize }, () => runner()));
+  if (firstError) throw firstError;
+}
+const HLS_SEGMENT_CONCURRENCY = Math.max(1, Number(process.env.HLS_PARALLEL_RENDITIONS) || 4);
+
+/**
  * Generate master HLS playlist referencing all quality playlists
  */
 function generateMasterPlaylist(hlsDir: string, qualities: string[]): string {
@@ -281,7 +429,7 @@ export async function startEncodingPipeline(
 ): Promise<void> {
   await acquireSlot();
   try {
-    const video = await Video.findById(videoId);
+    const video = await findVideoById(videoId);
     if (!video) throw new Error('Video not found');
 
     const hlsDir = path.join(HLS_BASE, videoId);
@@ -289,57 +437,62 @@ export async function startEncodingPipeline(
     fs.mkdirSync(hlsDir, { recursive: true });
     fs.mkdirSync(thumbDir, { recursive: true });
 
-    // Serializes every mutation+save of the shared `video` document. Renditions run
-    // concurrently below, so `video.streams.push(...)`/`video.save()` must not interleave.
-    const withVideoLock = createMutex();
-
-    // Progress must never go backwards for the frontend, even though several
-    // renditions report their own percentages concurrently.
+    // Progress must never go backwards for the frontend.
     let lastEmittedProgress = 0;
 
     const updateStage = async (stage: string, progress: number, detail?: string) => {
-      const clamped = Math.max(lastEmittedProgress, progress);
+      const clamped = Math.max(lastEmittedProgress, Math.round(progress));
       lastEmittedProgress = clamped;
       log(videoId, `${stage} ${clamped}%`);
-      await withVideoLock(async () => {
-        video.encodingStage = stage;
-        video.encodingProgress = clamped;
-        video.encodingLog.push(`[${new Date().toISOString()}] ${stage} (${clamped}%)`);
-        await video.save();
-      });
+      // Every field update is its own atomic UPDATE now -- no shared in-memory
+      // document, no mutex needed (that whole mechanism existed only because
+      // several concurrent renditions used to mutate one Mongoose document).
+      await updateVideo(videoId, { encodingStage: stage, encodingProgress: clamped });
+      await appendEncodingLog(videoId, `[${new Date().toISOString()}] ${stage} (${clamped}%)`);
+      emitEncodingProgress(io, videoId, ownerId, { stage, progress: clamped, detail });
+    };
+
+    // Lightweight, throttled tick for the *encode* stage's continuous ffmpeg
+    // progress -- emits over the socket only, never hits the DB every tick.
+    let lastTickAt = 0;
+    let lastTickProgress = -1;
+    const emitTick = (stage: string, progress: number, detail?: string, force = false) => {
+      const clamped = Math.max(lastEmittedProgress, Math.round(progress));
+      const now = Date.now();
+      if (!force && clamped === lastTickProgress && now - lastTickAt < 1000) return;
+      lastTickAt = now;
+      lastTickProgress = clamped;
+      lastEmittedProgress = clamped;
       emitEncodingProgress(io, videoId, ownerId, { stage, progress: clamped, detail });
     };
 
     // Stage 1: FFprobe - analyze source video
-    video.status = 'processing';
-    await video.save();
+    await updateVideo(videoId, { status: 'processing' });
     await updateStage('FFprobe analysis', 5);
     const probeData = await probe(inputPath);
     const videoStream = probeData.streams.find((s: any) => s.codec_type === 'video');
     const audioStream = probeData.streams.find((s: any) => s.codec_type === 'audio');
 
-    video.duration = Math.round(probeData.format.duration || 0);
-    video.width = videoStream?.width || 0;
-    video.height = videoStream?.height || 0;
+    const duration = Math.round(probeData.format.duration || 0);
+    const width = videoStream?.width || 0;
+    const height = videoStream?.height || 0;
     const fpsRaw = videoStream?.avg_frame_rate || '0';
     const [fpsNum, fpsDen] = fpsRaw.split('/').map(Number);
-    video.fps = fpsDen && fpsDen !== 0 ? parseFloat((fpsNum / fpsDen).toFixed(2)) : (fpsNum || 0);
-    video.codec = videoStream?.codec_name || 'unknown';
-    video.audioCodec = audioStream?.codec_name || 'unknown';
-    video.bitrate = Math.round((probeData.format.bit_rate || 0) / 1000);
-    video.status = 'encoding';
-    await video.save();
-    await updateStage('FFprobe complete', 10, `${video.width}x${video.height} ${video.fps.toFixed(1)}fps ${video.codec}`);
+    const fps = fpsDen && fpsDen !== 0 ? parseFloat((fpsNum / fpsDen).toFixed(2)) : (fpsNum || 0);
+    const codec = videoStream?.codec_name || 'unknown';
+    const audioCodec = audioStream?.codec_name || 'unknown';
+    const bitrate = Math.round((probeData.format.bit_rate || 0) / 1000);
+
+    await updateVideo(videoId, { duration, width, height, fps, codec, audioCodec, bitrate, status: 'encoding' });
+    await updateStage('FFprobe complete', 10, `${width}x${height} ${fps.toFixed(1)}fps ${codec}`);
 
     // Stage 2: Generate multiple thumbnails for user selection
     await updateStage('Generating thumbnails', 12);
     try {
       const thumbPaths = await generateThumbnails(videoId, inputPath, thumbDir);
       if (thumbPaths.length > 0) {
-        // Store absolute path for thumbnailPath - toUrl will convert it
-        video.thumbnailPath = thumbPaths[0]; // Default to first thumbnail
-        video.encodingLog.push(`[${new Date().toISOString()}] Generated ${thumbPaths.length} thumbnails for selection`);
-        await video.save();
+        await updateVideo(videoId, { thumbnailPath: thumbPaths[0] });
+        await appendEncodingLog(videoId, `[${new Date().toISOString()}] Generated ${thumbPaths.length} thumbnails for selection`);
       }
     } catch (e: any) {
       log(videoId, `Thumbnail warning: ${e.message}`);
@@ -347,161 +500,71 @@ export async function startEncodingPipeline(
     }
     await updateStage('Thumbnails generated', 20);
 
-    // Stage 3 + 4: encode each quality (only up to source resolution) and HLS-segment it.
-    // Renditions run concurrently (bounded by RENDITION_CONCURRENCY) and each one's HLS
-    // segmentation starts as soon as *that* rendition's encode finishes, rather than
-    // waiting for every encode to complete first.
-    const encodedPaths: Record<string, string> = {};
-    const streamResults: Record<string, IVideoStream> = {};
+    // Stage 3: single-decode, multi-output, hardware-accelerated-when-available encode
     const baseProgress = 20;
-    const encProgressRange = 55;  // 20% -> 75%
-    const hlsProgressRange = 18;  // 75% -> 93%
-    const sourceHeight = video.height || 1080;
+    const encProgressRange = 55; // 20% -> 75%
+    const hlsProgressRange = 18; // 75% -> 93%
+    const sourceHeight = height || 1080;
     const applicableQualities = QUALITIES.filter(q => parseInt(q.name) <= sourceHeight * 1.1);
-    const qualityCount = Math.max(1, applicableQualities.length);
-    const perQualityEncode = encProgressRange / qualityCount;
-    const perQualityHls = hlsProgressRange / qualityCount;
-
-    // Per-rendition completion, aggregated into one overall percentage.
-    const encodePct: Record<string, number> = {};
-    const hlsPct: Record<string, number> = {};
-    const activePhase: Record<string, 'encode' | 'hls'> = {};
-    for (const q of applicableQualities) { encodePct[q.name] = 0; hlsPct[q.name] = 0; }
-
-    const computeProgress = (): number => {
-      let p = baseProgress;
-      for (const q of applicableQualities) {
-        p += (encodePct[q.name] / 100) * perQualityEncode;
-        p += (hlsPct[q.name] / 100) * perQualityHls;
-      }
-      return Math.min(baseProgress + encProgressRange + hlsProgressRange, Math.round(p));
-    };
-
-    const describeStage = (): string => {
-      const encoding = applicableQualities.filter(q => activePhase[q.name] === 'encode').map(q => q.name);
-      const segmenting = applicableQualities.filter(q => activePhase[q.name] === 'hls').map(q => q.name);
-      const parts: string[] = [];
-      if (encoding.length) parts.push(`Encoding ${encoding.join(', ')}`);
-      if (segmenting.length) parts.push(`HLS segmentation ${segmenting.join(', ')}`);
-      return parts.length ? parts.join(' | ') : 'Encoding renditions';
-    };
-
-    const describeDetail = (): string => {
-      const inFlight = applicableQualities
-        .filter(q => activePhase[q.name])
-        .map(q => {
-          const pct = activePhase[q.name] === 'encode' ? encodePct[q.name] : hlsPct[q.name];
-          return `${q.name} ${pct.toFixed(1)}%`;
-        });
-      const done = applicableQualities.filter(q => hlsPct[q.name] >= 100).length;
-      const summary = `${done}/${applicableQualities.length} renditions ready`;
-      return inFlight.length ? `${inFlight.join(' · ')} · ${summary}` : summary;
-    };
-
-    // Lightweight, throttled tick: emits only, never touches the DB.
-    let lastTickAt = 0;
-    let lastTickProgress = -1;
-    const emitAggregate = (force = false): void => {
-      const progress = Math.max(lastEmittedProgress, computeProgress());
-      const now = Date.now();
-      if (!force && progress === lastTickProgress && now - lastTickAt < 1000) return;
-      lastTickAt = now;
-      lastTickProgress = progress;
-      lastEmittedProgress = progress;
-      emitEncodingProgress(io, videoId, ownerId, {
-        stage: describeStage(),
-        progress,
-        detail: describeDetail(),
-      });
-    };
 
     if (applicableQualities.length > 0) {
-      await updateStage(
-        `Encoding ${applicableQualities.map(q => q.name).join(', ')}`,
-        baseProgress,
-        `${applicableQualities.length} renditions, up to ${RENDITION_CONCURRENCY} in parallel`
-      );
+      await updateStage(`Encoding ${applicableQualities.map(q => q.name).join(', ')}`, baseProgress, 'single-pass, all renditions together');
     }
 
-    const runRendition = async (q: typeof QUALITIES[0]): Promise<void> => {
-      // --- encode ---
-      activePhase[q.name] = 'encode';
-      emitAggregate(true);
-      const outPath = await encodeRendition(inputPath, hlsDir, q, (pct) => {
-        const clean = Math.min(100, Math.max(0, pct));
-        if (clean > encodePct[q.name]) encodePct[q.name] = clean;
-        emitAggregate();
-      });
-      encodePct[q.name] = 100;
-      encodedPaths[q.name] = outPath;
+    const encodedPaths = await encodeAllRenditions(
+      videoId, inputPath, hlsDir, applicableQualities, duration,
+      (pct) => emitTick(
+        `Encoding ${applicableQualities.map(q => q.name).join(', ')}`,
+        baseProgress + (pct / 100) * encProgressRange,
+        `${pct.toFixed(1)}%`,
+      )
+    );
+    await updateStage('Encoding complete', baseProgress + encProgressRange);
 
-      // --- record the stream (serialized: concurrent saves would clobber each other) ---
-      const stats = fs.statSync(outPath);
-      const stream: IVideoStream = {
-        quality: q.name as any,
-        bitrate: parseInt(q.bitrate),
-        path: outPath,
-        size: stats.size,
-        status: 'done',
-      };
-      streamResults[q.name] = stream;
-      await withVideoLock(async () => {
-        video.streams.push(stream);
-        await video.save();
-      });
-
-      // --- segment this rendition immediately, without waiting for the others ---
-      activePhase[q.name] = 'hls';
-      await updateStage(`Encoded ${q.name}`, computeProgress(), describeDetail());
-      await generateHLS(outPath, hlsDir, q.name, (pct) => {
-        const clean = Math.min(100, Math.max(0, pct));
-        if (clean > hlsPct[q.name]) hlsPct[q.name] = clean;
-        emitAggregate();
-      });
-      hlsPct[q.name] = 100;
-      delete activePhase[q.name];
-      await updateStage(`HLS segmentation ${q.name} complete`, computeProgress(), describeDetail());
+    // Stage 4: HLS segmentation per rendition (cheap stream-copy, still parallelized)
+    const encodedQualities = applicableQualities.map(q => q.name).filter(name => encodedPaths[name]);
+    const hlsPct: Record<string, number> = {};
+    for (const name of encodedQualities) hlsPct[name] = 0;
+    const perQualityHls = hlsProgressRange / Math.max(1, encodedQualities.length);
+    const computeHlsProgress = () => {
+      const done = encodedQualities.reduce((sum, name) => sum + (hlsPct[name] / 100) * perQualityHls, 0);
+      return baseProgress + encProgressRange + done;
     };
 
-    await mapWithConcurrency(applicableQualities, RENDITION_CONCURRENCY, runRendition);
-
-    // Renditions finish out of order, so normalize `streams` back to ascending quality
-    // order (same contents/order the old sequential loop produced) in one final write.
-    const encodedQualities = applicableQualities.map(q => q.name).filter(name => encodedPaths[name]);
-    if (encodedQualities.length > 0) {
-      await withVideoLock(async () => {
-        video.set('streams', encodedQualities.map(name => streamResults[name]));
-        await video.save();
+    await mapWithConcurrency(encodedQualities, HLS_SEGMENT_CONCURRENCY, async (qName) => {
+      await generateHLS(encodedPaths[qName], hlsDir, qName, (pct) => {
+        hlsPct[qName] = Math.max(hlsPct[qName], Math.min(100, Math.max(0, pct)));
+        emitTick(`HLS segmentation`, computeHlsProgress(), `${qName} ${hlsPct[qName].toFixed(0)}%`);
       });
-    }
-    await updateStage('Encoding complete', baseProgress + encProgressRange + hlsProgressRange);
+      hlsPct[qName] = 100;
+
+      const stats = fs.statSync(encodedPaths[qName]);
+      const q = applicableQualities.find(x => x.name === qName)!;
+      await addVideoStream(videoId, {
+        quality: qName as any,
+        bitrate: parseInt(q.bitrate),
+        path: encodedPaths[qName],
+        size: stats.size,
+        status: 'done',
+      });
+    });
+    await updateStage('HLS segmentation complete', baseProgress + encProgressRange + hlsProgressRange);
 
     // Stage 5: Master playlist
     await updateStage('Generating master playlist', 94);
     const masterPath = generateMasterPlaylist(hlsDir, encodedQualities);
-    // Store path relative to storage base for proper URL generation
-    const storageBase = process.env.STORAGE_LOCAL_PATH
-      ? path.resolve(process.env.STORAGE_LOCAL_PATH)
-      : path.join(__dirname, '..', '..', 'uploads');
-    video.hlsPath = masterPath;
-    await video.save();
+    await updateVideo(videoId, { hlsPath: masterPath });
 
     // Stage 6: Done
-    video.status = 'published';
-    video.encodingProgress = 100;
-    video.encodingStage = 'Ready';
-    await video.save();
+    await updateVideo(videoId, { status: 'published', encodingProgress: 100, encodingStage: 'Ready' });
     await updateStage('Ready', 100);
 
-    emitEncodingDone(io, videoId, ownerId, video.toJSON());
+    const finalVideo = await getApiVideo(videoId);
+    emitEncodingDone(io, videoId, ownerId, finalVideo);
     log(videoId, '✅ Pipeline complete');
   } catch (err: any) {
     log(videoId, `❌ Pipeline error: ${err.message}`);
-    await Video.findByIdAndUpdate(videoId, {
-      status: 'failed',
-      encodingError: err.message,
-      encodingStage: 'Failed',
-    });
+    await markVideoFailed(videoId, err.message);
     emitEncodingError(io, videoId, ownerId, err.message);
   } finally {
     releaseSlot();
@@ -529,5 +592,5 @@ export async function updateVideoThumbnail(videoId: string, thumbnailRelPath: st
     ? path.resolve(process.env.STORAGE_LOCAL_PATH)
     : path.join(__dirname, '..', '..', 'uploads');
   const absPath = path.join(storageBase, thumbnailRelPath);
-  await Video.findByIdAndUpdate(videoId, { thumbnailPath: absPath });
+  await updateVideo(videoId, { thumbnailPath: absPath });
 }

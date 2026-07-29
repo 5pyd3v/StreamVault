@@ -1,6 +1,15 @@
 import express from 'express';
 import jwt from 'jsonwebtoken';
-import User from '../models/User.js';
+import {
+  findUserById,
+  findUserByEmail,
+  createUser,
+  countUsers,
+  comparePassword,
+  updateLastLogin,
+  updatePassword,
+  toPublicUser,
+} from '../db/users.js';
 import { protect, AuthRequest } from '../middleware/auth.js';
 
 const router = express.Router();
@@ -17,20 +26,23 @@ router.post('/register', async (req, res) => {
     const { name, email, password, organization } = req.body;
     if (!name || !email || !password) return res.status(400).json({ error: 'Name, email, and password are required' });
 
-    const exists = await User.findOne({ email });
+    const exists = await findUserByEmail(email);
     if (exists) return res.status(409).json({ error: 'Email already registered' });
 
     // First user becomes admin
-    const count = await User.countDocuments();
-    const user = await User.create({ name, email, password, organization, role: count === 0 ? 'admin' : 'viewer' });
+    const count = await countUsers();
+    const created = await createUser({ name, email, password, organization, role: count === 0 ? 'admin' : 'viewer' });
 
-    user.lastLogin = new Date();
-    await user.save();
+    await updateLastLogin(created.id);
+    // Re-read so the response carries the freshly stamped lastLogin, exactly like
+    // the old `user.lastLogin = new Date(); await user.save();` did.
+    const row = (await findUserById(created.id)) ?? created;
 
-    const token = signToken(user.id);
-    const refreshToken = signRefresh(user.id);
+    const id = String(created.id);
+    const token = signToken(id);
+    const refreshToken = signRefresh(id);
 
-    res.status(201).json({ token, refreshToken, user });
+    res.status(201).json({ token, refreshToken, user: toPublicUser(row) });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -42,19 +54,20 @@ router.post('/login', async (req, res) => {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
 
-    const user = await User.findOne({ email }).select('+password');
-    if (!user || !(await user.comparePassword(password))) {
+    const found = await findUserByEmail(email);
+    if (!found || !(await comparePassword(password, found.password))) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
-    if (!user.active) return res.status(403).json({ error: 'Account suspended' });
+    if (!found.active) return res.status(403).json({ error: 'Account suspended' });
 
-    user.lastLogin = new Date();
-    await user.save();
+    await updateLastLogin(found.id);
+    const row = (await findUserById(found.id)) ?? found;
 
-    const token = signToken(user.id);
-    const refreshToken = signRefresh(user.id);
+    const id = String(found.id);
+    const token = signToken(id);
+    const refreshToken = signRefresh(id);
 
-    res.json({ token, refreshToken, user });
+    res.json({ token, refreshToken, user: toPublicUser(row) });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -66,9 +79,9 @@ router.post('/refresh', async (req, res) => {
     const { refreshToken } = req.body;
     if (!refreshToken) return res.status(401).json({ error: 'No refresh token' });
     const decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET!) as { id: string };
-    const user = await User.findById(decoded.id);
+    const user = await findUserById(decoded.id);
     if (!user) return res.status(401).json({ error: 'User not found' });
-    res.json({ token: signToken(user.id) });
+    res.json({ token: signToken(String(user.id)) });
   } catch {
     res.status(401).json({ error: 'Invalid refresh token' });
   }
@@ -90,14 +103,13 @@ router.post('/change-password', protect, async (req: AuthRequest, res) => {
       return res.status(400).json({ error: 'New password must be at least 8 characters' });
     }
 
-    const user = await User.findById(req.user!._id).select('+password');
+    const user = await findUserById(req.user!._id);
     if (!user) return res.status(404).json({ error: 'User not found' });
 
-    const valid = await user.comparePassword(currentPassword);
+    const valid = await comparePassword(currentPassword, user.password);
     if (!valid) return res.status(401).json({ error: 'Current password is incorrect' });
 
-    user.password = newPassword;
-    await user.save();
+    await updatePassword(user.id, newPassword);
     res.json({ message: 'Password changed successfully' });
   } catch (err: any) {
     res.status(500).json({ error: err.message });

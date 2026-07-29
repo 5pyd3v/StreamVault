@@ -1,9 +1,9 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
-import User, { IUser } from '../models/User.js';
+import { findUserById, toPublicUser, PublicUser } from '../db/users.js';
 
 export interface AuthRequest extends Request {
-  user?: IUser;
+  user?: PublicUser;
 }
 
 export const protect = async (req: AuthRequest, res: Response, next: NextFunction) => {
@@ -15,9 +15,10 @@ export const protect = async (req: AuthRequest, res: Response, next: NextFunctio
   try {
     const token = authHeader.split(' ')[1];
     const decoded = jwt.verify(token, process.env.JWT_SECRET!) as { id: string };
-    const user = await User.findById(decoded.id).select('-password');
-    if (!user || !user.active) return res.status(401).json({ error: 'Unauthorized' });
-    req.user = user;
+    // MySQL stores `active` as TINYINT(1) -> check the raw 0/1 before shaping.
+    const row = await findUserById(decoded.id);
+    if (!row || !row.active) return res.status(401).json({ error: 'Unauthorized' });
+    req.user = toPublicUser(row);
     next();
   } catch {
     res.status(401).json({ error: 'Invalid token' });

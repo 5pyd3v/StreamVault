@@ -6,8 +6,17 @@ import crypto from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import { fileURLToPath } from 'url';
 import { protect, requireAdmin, AuthRequest } from '../middleware/auth.js';
-import UploadSession from '../models/UploadSession.js';
-import Video from '../models/Video.js';
+import {
+  findActiveSession,
+  findSessionByUploadId,
+  createSession,
+  getReceivedChunks,
+  countReceivedChunks,
+  recordChunk,
+  setSessionStatus,
+  setSessionVideoId,
+} from '../db/uploadSessions.js';
+import { createVideo } from '../db/videos.js';
 import { startEncodingPipeline } from '../services/encoder.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -59,25 +68,20 @@ router.post('/init', protect, requireAdmin, async (req: AuthRequest, res) => {
     }
 
     // Check for existing active session (resume support)
-    const existing = await UploadSession.findOne({
-      owner: req.user!._id,
-      filename,
-      totalSize: Number(totalSize),
-      status: 'active',
-    });
+    const existing = await findActiveSession(Number(req.user!._id), filename, Number(totalSize));
     if (existing) {
-      const receivedIndexes = existing.receivedChunks.map(c => c.index).sort((a, b) => a - b);
+      const receivedIndexes = (await getReceivedChunks(existing.id)).map(c => c.chunk_index).sort((a, b) => a - b);
       // Find the first missing chunk index for resume
       let resumeFrom = 0;
-      for (let i = 0; i < existing.totalChunks; i++) {
+      for (let i = 0; i < existing.total_chunks; i++) {
         if (!receivedIndexes.includes(i)) { resumeFrom = i; break; }
         resumeFrom = i + 1;
       }
       return res.json({
-        uploadId: existing.uploadId,
-        totalChunks: existing.totalChunks,
-        chunkSize: existing.chunkSize,
-        resumeFrom: resumeFrom < existing.totalChunks ? resumeFrom : 0,
+        uploadId: existing.upload_id,
+        totalChunks: existing.total_chunks,
+        chunkSize: existing.chunk_size,
+        resumeFrom: resumeFrom < existing.total_chunks ? resumeFrom : 0,
       });
     }
 
@@ -86,9 +90,9 @@ router.post('/init', protect, requireAdmin, async (req: AuthRequest, res) => {
     const tempDir = path.join(getTempDir(), uploadId);
     fs.mkdirSync(tempDir, { recursive: true });
 
-    const session = await UploadSession.create({
+    await createSession({
       uploadId,
-      owner: req.user!._id,
+      ownerId: Number(req.user!._id),
       filename,
       mimeType: mimeType || 'video/mp4',
       totalSize: Number(totalSize),
@@ -111,12 +115,12 @@ router.post('/chunk', protect, requireAdmin, upload.single('chunk'), async (req:
       return res.status(400).json({ error: 'uploadId, chunkIndex, and chunk file required' });
     }
 
-    const session = await UploadSession.findOne({ uploadId, owner: req.user!._id });
+    const session = await findSessionByUploadId(uploadId, Number(req.user!._id));
     if (!session) return res.status(404).json({ error: 'Upload session not found' });
     if (session.status !== 'active') return res.status(409).json({ error: 'Session not active' });
 
     // Rename to deterministic filename
-    const destPath = path.join(session.tempDir, `chunk_${chunkIndex.toString().padStart(6, '0')}`);
+    const destPath = path.join(session.temp_dir, `chunk_${chunkIndex.toString().padStart(6, '0')}`);
     fs.renameSync(req.file.path, destPath);
 
     // Verify hash if provided
@@ -130,19 +134,12 @@ router.post('/chunk', protect, requireAdmin, upload.single('chunk'), async (req:
       }
     }
 
-    const alreadyReceived = session.receivedChunks.some(c => c.index === Number(chunkIndex));
-    if (!alreadyReceived) {
-      session.receivedChunks.push({
-        index: Number(chunkIndex),
-        size: req.file.size,
-        hash: computedHash || hash || '',
-        receivedAt: new Date(),
-      });
-      await session.save();
-    }
+    // INSERT ... ON DUPLICATE KEY: re-uploading a chunk index is a no-op update,
+    // so the old "have I already got this index?" scan is unnecessary.
+    await recordChunk(session.id, Number(chunkIndex), req.file.size, computedHash || hash || '');
 
-    const received = session.receivedChunks.length;
-    const total = session.totalChunks;
+    const received = await countReceivedChunks(session.id);
+    const total = session.total_chunks;
 
     res.json({
       chunkIndex: Number(chunkIndex),
@@ -160,19 +157,19 @@ router.post('/chunk', protect, requireAdmin, upload.single('chunk'), async (req:
 router.post('/merge', protect, requireAdmin, async (req: AuthRequest, res) => {
   try {
     const { uploadId } = req.body;
-    const session = await UploadSession.findOne({ uploadId, owner: req.user!._id });
+    const session = await findSessionByUploadId(uploadId, Number(req.user!._id));
     if (!session) return res.status(404).json({ error: 'Session not found' });
 
-    if (session.receivedChunks.length < session.totalChunks) {
+    const receivedCount = await countReceivedChunks(session.id);
+    if (receivedCount < session.total_chunks) {
       return res.status(400).json({
         error: 'Not all chunks received',
-        received: session.receivedChunks.length,
-        expected: session.totalChunks,
+        received: receivedCount,
+        expected: session.total_chunks,
       });
     }
 
-    session.status = 'merging';
-    await session.save();
+    await setSessionStatus(session.id, 'merging');
 
     const ext = path.extname(session.filename);
     const storageBase = process.env.STORAGE_LOCAL_PATH
@@ -182,8 +179,9 @@ router.post('/merge', protect, requireAdmin, async (req: AuthRequest, res) => {
     fs.mkdirSync(videosDir, { recursive: true });
     const outputPath = path.join(videosDir, `${uuidv4()}${ext}`);
 
-    // Merge chunks sequentially using proper streaming (handles large files)
-    const sortedChunks = [...session.receivedChunks].sort((a, b) => a.index - b.index);
+    // Merge chunks sequentially using proper streaming (handles large files).
+    // getReceivedChunks() already returns them ordered by chunk_index ASC.
+    const sortedChunks = await getReceivedChunks(session.id);
 
     await new Promise<void>((resolve, reject) => {
       const writeStream = fs.createWriteStream(outputPath);
@@ -193,7 +191,7 @@ router.post('/merge', protect, requireAdmin, async (req: AuthRequest, res) => {
       (async () => {
         try {
           for (const chunk of sortedChunks) {
-            const chunkPath = path.join(session.tempDir, `chunk_${chunk.index.toString().padStart(6, '0')}`);
+            const chunkPath = path.join(session.temp_dir, `chunk_${chunk.chunk_index.toString().padStart(6, '0')}`);
             if (!fs.existsSync(chunkPath)) {
               throw new Error(`Missing chunk file: ${chunkPath}`);
             }
@@ -220,27 +218,26 @@ router.post('/merge', protect, requireAdmin, async (req: AuthRequest, res) => {
     console.log(`[upload] Merged ${sortedChunks.length} chunks → ${outputPath} (${outStat.size} bytes)`);
 
     // Create video record
-    const video = await Video.create({
+    const video = await createVideo({
       title: session.filename.replace(ext, '').replace(/_/g, ' '),
-      owner: session.owner,
+      ownerId: session.owner_id,
       originalName: session.filename,
-      mimeType: session.mimeType,
-      sizeBytes: session.totalSize,
+      mimeType: session.mime_type,
+      sizeBytes: session.total_size,
       originalPath: outputPath,
       status: 'processing',
     });
 
-    session.status = 'done';
-    session.videoId = video._id as any;
-    await session.save();
+    // Flips status to 'done' and stores the video id in one statement.
+    await setSessionVideoId(session.id, video.id);
 
     // Cleanup temp chunks
-    fs.rmSync(session.tempDir, { recursive: true, force: true });
+    fs.rmSync(session.temp_dir, { recursive: true, force: true });
 
     // Start async encoding pipeline (non-blocking)
-    startEncodingPipeline(video._id.toString(), outputPath, video.owner.toString());
+    startEncodingPipeline(String(video.id), outputPath, String(video.owner_id));
 
-    res.json({ videoId: video._id, message: 'Merge complete, encoding started' });
+    res.json({ videoId: String(video.id), message: 'Merge complete, encoding started' });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -249,14 +246,15 @@ router.post('/merge', protect, requireAdmin, async (req: AuthRequest, res) => {
 // ── Get session status ────────────────────────────────────────────────────────
 router.get('/status/:uploadId', protect, requireAdmin, async (req: AuthRequest, res) => {
   try {
-    const session = await UploadSession.findOne({ uploadId: req.params.uploadId, owner: req.user!._id });
+    const session = await findSessionByUploadId(req.params.uploadId, Number(req.user!._id));
     if (!session) return res.status(404).json({ error: 'Not found' });
+    const received = await countReceivedChunks(session.id);
     res.json({
-      uploadId: session.uploadId,
+      uploadId: session.upload_id,
       status: session.status,
-      received: session.receivedChunks.length,
-      total: session.totalChunks,
-      progress: Math.round((session.receivedChunks.length / session.totalChunks) * 100),
+      received,
+      total: session.total_chunks,
+      progress: Math.round((received / session.total_chunks) * 100),
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message });

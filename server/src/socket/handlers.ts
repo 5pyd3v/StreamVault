@@ -1,6 +1,6 @@
 import { Server, Socket } from 'socket.io';
 import jwt from 'jsonwebtoken';
-import User from '../models/User.js';
+import { findUserById, toPublicUser } from '../db/users.js';
 
 export function registerSocketHandlers(io: Server): void {
   // Authenticate socket connections
@@ -9,9 +9,11 @@ export function registerSocketHandlers(io: Server): void {
     if (!token) return next(new Error('Authentication required'));
     try {
       const decoded = jwt.verify(String(token), process.env.JWT_SECRET!) as { id: string };
-      const user = await User.findById(decoded.id).select('_id name email role');
-      if (!user) return next(new Error('User not found'));
-      (socket as any).user = user;
+      const row = await findUserById(decoded.id);
+      if (!row) return next(new Error('User not found'));
+      // Same minimal projection the old `.select('_id name email role')` produced.
+      const { _id, name, email, role } = toPublicUser(row);
+      (socket as any).user = { _id, name, email, role };
       next();
     } catch {
       next(new Error('Invalid token'));
@@ -85,17 +87,21 @@ export function emitEncodingError(io: Server, videoId: string, ownerId: string, 
 }
 
 // ── Live channel events (called from the live media server / live encoder) ────
-// Strip the secret stream key before anything leaves the process.
+// Strip the secret stream key before anything leaves the process. `channel`
+// is now a raw MySQL row (snake_case `stream_key`, numeric `id`, no `_id`) --
+// callers like `liveMediaServer.ts`'s postPublish pass rows straight from
+// `findChannelByStreamKey`, which explicitly includes the key.
 function publicChannel(channel: any): any {
-  const obj = channel?.toObject ? channel.toObject() : { ...channel };
-  delete obj.streamKey;
+  const obj = { ...channel };
+  delete obj.stream_key;
+  delete obj.streamKey; // defensive: harmless no-op if a caller ever passes an already-shaped object instead
   return obj;
 }
 
 // Emit a channel going live (broadcast globally so browse pages react without subscribing)
 export function emitChannelLive(io: Server, channel: any): void {
   const safe = publicChannel(channel);
-  const channelId = String(safe._id);
+  const channelId = String(channel.id ?? channel._id);
   const event = { channelId, channel: safe, ts: new Date().toISOString() };
   io.to(`channel:${channelId}`).emit('live:started', event);
   io.to('admin').emit('live:started', event);

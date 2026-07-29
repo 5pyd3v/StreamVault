@@ -2,8 +2,13 @@ import { Server } from 'socket.io';
 import { ChildProcess } from 'child_process';
 import { v4 as uuidv4 } from 'uuid';
 import NodeMediaServer from 'node-media-server';
-import LiveChannel from '../models/LiveChannel.js';
-import { startLiveTranscode, liveHlsMasterPath, captureChannelPosterIfMissing } from './liveEncoder.js';
+import {
+  findChannelByStreamKey,
+  setChannelLive,
+  setChannelOffline,
+  setChannelError,
+} from '../db/liveChannels.js';
+import { startLiveTranscode, captureChannelPosterIfMissing } from './liveEncoder.js';
 import { handleRecordingFinished } from './liveRecording.js';
 import { emitChannelLive, emitChannelOffline, emitChannelError } from '../socket/handlers.js';
 
@@ -65,11 +70,11 @@ export function startLiveMediaServer(io: Server): NodeMediaServer {
       const { app, streamKey } = parseStreamPath(streamPath);
       if (!streamKey) return rejectSession(id, 'missing stream key');
       try {
-        const channel = await LiveChannel.findOne({ streamKey }).select('+streamKey');
+        const channel = await findChannelByStreamKey(streamKey);
         if (!channel) return rejectSession(id, 'unknown stream key');
-        if (!channel.isEnabled) return rejectSession(id, `channel "${channel.slug}" is disabled`);
-        if (channel.rtmpApp && channel.rtmpApp !== app) {
-          return rejectSession(id, `wrong rtmp app "${app}" (expected "${channel.rtmpApp}")`);
+        if (!channel.is_enabled) return rejectSession(id, `channel "${channel.slug}" is disabled`);
+        if (channel.rtmp_app && channel.rtmp_app !== app) {
+          return rejectSession(id, `wrong rtmp app "${app}" (expected "${channel.rtmp_app}")`);
         }
         log(`Accepted publish for channel "${channel.slug}" (session ${id})`);
       } catch (err: any) {
@@ -85,23 +90,20 @@ export function startLiveMediaServer(io: Server): NodeMediaServer {
       const { streamKey } = parseStreamPath(streamPath);
       let channelId = '';
       try {
-        const channel = await LiveChannel.findOne({ streamKey }).select('+streamKey');
+        const channel = await findChannelByStreamKey(streamKey);
         if (!channel) return rejectSession(id, 'unknown stream key');
 
-        channelId = String(channel._id);
+        channelId = String(channel.id);
         const sessionId = uuidv4();
 
-        channel.status = 'live';
-        channel.currentSessionId = sessionId;
-        channel.liveStartedAt = new Date();
-        channel.lastError = '';
-        channel.liveHlsPath = liveHlsMasterPath(channelId);
-        channel.viewerCount = 0;
-        await channel.save();
+        await setChannelLive(channel.id, sessionId);
 
         rtmpSessions.set(channelId, id);
         log(`🔴 ${channel.slug} is LIVE (session ${sessionId})`);
-        emitChannelLive(io, channel);
+        // The row came back from a *WithKey lookup, so drop the secret before it
+        // reaches the socket layer -- emitChannelLive broadcasts to every client.
+        const { stream_key: _streamKey, ...safeChannel } = channel;
+        emitChannelLive(io, safeChannel);
 
         const proc = startLiveTranscode(channel, sessionId);
         transcoders.set(channelId, proc);
@@ -118,9 +120,7 @@ export function startLiveMediaServer(io: Server): NodeMediaServer {
       } catch (err: any) {
         console.error(`[live-rtmp] postPublish failed: ${err.message}`);
         if (channelId) {
-          await LiveChannel.findByIdAndUpdate(channelId, {
-            status: 'error', lastError: err.message, liveHlsPath: '',
-          }).catch(() => { /* best effort */ });
+          await setChannelError(channelId, err.message).catch(() => { /* best effort */ });
           emitChannelError(io, channelId, err.message);
         }
         rejectSession(id, 'startup failure');
@@ -133,15 +133,11 @@ export function startLiveMediaServer(io: Server): NodeMediaServer {
     void (async () => {
       const { streamKey } = parseStreamPath(streamPath);
       try {
-        const channel = await LiveChannel.findOne({ streamKey }).select('+streamKey');
+        const channel = await findChannelByStreamKey(streamKey);
         if (!channel) return;
 
-        const channelId = String(channel._id);
-        channel.status = 'offline';
-        channel.currentSessionId = null;
-        channel.liveHlsPath = '';
-        channel.viewerCount = 0;
-        await channel.save();
+        const channelId = String(channel.id);
+        await setChannelOffline(channel.id);
 
         rtmpSessions.delete(channelId);
         log(`⚫ ${channel.slug} went offline (session ${id})`);

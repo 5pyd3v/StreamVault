@@ -1,8 +1,20 @@
 import express from 'express';
 import fs from 'fs';
-import Video from '../models/Video.js';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { pool } from '../db/pool.js';
+import { findVideoById, updateVideo, type VideoRow } from '../db/videos.js';
+import { listVideoStreams, deleteVideoStreams } from '../db/videoStreams.js';
 import { protect, requireAdmin, AuthRequest } from '../middleware/auth.js';
-import { startEncodingPipeline, generateThumbnailOptions, updateVideoThumbnail } from '../services/encoder.js';
+import { startEncodingPipeline, generateThumbnailOptions } from '../services/encoder.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+function storageBase(): string {
+  return process.env.STORAGE_LOCAL_PATH
+    ? path.resolve(process.env.STORAGE_LOCAL_PATH)
+    : path.join(__dirname, '..', '..', 'uploads');
+}
 
 const router = express.Router();
 
@@ -17,17 +29,37 @@ const router = express.Router();
 // leaked the title / encoding log / failure reason of any video by id.
 
 // ── Active encoding jobs ──────────────────────────────────────────────────────
+// `listVideos` filters on a single status, but this needs both 'processing' and
+// 'encoding' at once (the old `$in`), so it drops to a local parameterised query.
+// The admin/owner split is folded into one predicate: the first placeholder is 1
+// for admins, which short-circuits the owner match to always-true; for everyone
+// else it is 0 and only their own rows survive.
 router.get('/jobs', protect, requireAdmin, async (req: AuthRequest, res) => {
   try {
-    const match: any = { status: { $in: ['processing', 'encoding'] } };
-    if (req.user!.role !== 'admin') match.owner = req.user!._id;
+    const isAdmin = req.user!.role === 'admin';
+    const [rows] = await pool.query<VideoRow[]>(
+      `SELECT * FROM videos
+       WHERE status IN ('processing', 'encoding')
+         AND (? = 1 OR owner_id = ?)
+       ORDER BY created_at DESC
+       LIMIT 20`,
+      [isAdmin ? 1 : 0, Number(req.user!._id) || 0]
+    );
 
-    const videos = await Video.find(match)
-      .select('title originalName encodingProgress encodingStage encodingError status createdAt sizeBytes')
-      .sort('-createdAt')
-      .limit(20);
+    // Same projection the old `.select(...)` produced (Mongoose always keeps _id).
+    const jobs = rows.map(row => ({
+      _id: String(row.id),
+      title: row.title,
+      originalName: row.original_name,
+      encodingProgress: row.encoding_progress,
+      encodingStage: row.encoding_stage,
+      encodingError: row.encoding_error ?? undefined,
+      status: row.status,
+      createdAt: row.created_at,
+      sizeBytes: Number(row.size_bytes),
+    }));
 
-    res.json({ jobs: videos });
+    res.json({ jobs });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -36,10 +68,26 @@ router.get('/jobs', protect, requireAdmin, async (req: AuthRequest, res) => {
 // ── Single job status ─────────────────────────────────────────────────────────
 router.get('/jobs/:id', protect, requireAdmin, async (req: AuthRequest, res) => {
   try {
-    const video = await Video.findById(req.params.id)
-      .select('title encodingProgress encodingStage encodingLog encodingError status streams');
+    const video = await findVideoById(req.params.id);
     if (!video) return res.status(404).json({ error: 'Not found' });
-    res.json(video);
+    const streams = await listVideoStreams(req.params.id);
+
+    res.json({
+      _id: String(video.id),
+      title: video.title,
+      encodingProgress: video.encoding_progress,
+      encodingStage: video.encoding_stage,
+      encodingLog: video.encoding_log ? JSON.parse(video.encoding_log) : [],
+      encodingError: video.encoding_error ?? undefined,
+      status: video.status,
+      streams: streams.map(s => ({
+        quality: s.quality,
+        bitrate: s.bitrate,
+        path: s.path,
+        size: Number(s.size),
+        status: s.status,
+      })),
+    });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -48,9 +96,9 @@ router.get('/jobs/:id', protect, requireAdmin, async (req: AuthRequest, res) => 
 // ── Retry failed encoding ─────────────────────────────────────────────────────
 router.post('/jobs/:id/retry', protect, requireAdmin, async (req: AuthRequest, res) => {
   try {
-    const video = await Video.findById(req.params.id);
+    const video = await findVideoById(req.params.id);
     if (!video) return res.status(404).json({ error: 'Not found' });
-    if (req.user!.role !== 'admin' && video.owner.toString() !== req.user!._id.toString()) {
+    if (req.user!.role !== 'admin' && String(video.owner_id) !== req.user!._id) {
       return res.status(403).json({ error: 'Forbidden' });
     }
     // Allow retry for failed OR stuck-in-processing videos (in case server restarted)
@@ -58,23 +106,26 @@ router.post('/jobs/:id/retry', protect, requireAdmin, async (req: AuthRequest, r
       return res.status(400).json({ error: `Cannot retry a ${video.status} video` });
     }
     // Verify source file still exists
-    if (!video.originalPath || !fs.existsSync(video.originalPath)) {
-      video.status = 'failed';
-      video.encodingError = 'Original source file no longer exists on disk. Please re-upload.';
-      await video.save();
-      return res.status(400).json({ error: video.encodingError });
+    if (!video.original_path || !fs.existsSync(video.original_path)) {
+      const encodingError = 'Original source file no longer exists on disk. Please re-upload.';
+      await updateVideo(req.params.id, { status: 'failed', encodingError });
+      return res.status(400).json({ error: encodingError });
     }
 
-    video.status = 'processing';
-    video.encodingProgress = 0;
-    video.encodingStage = 'Queued for retry';
-    video.encodingError = undefined;
-    video.encodingLog = [];
-    video.streams = [] as any;
-    await video.save();
+    // Streams are their own table now, so the old `video.streams = []` wipe is a
+    // delete — done before the status flip so a concurrent read never sees
+    // "processing" alongside the previous run's finished renditions.
+    await deleteVideoStreams(req.params.id);
+    await updateVideo(req.params.id, {
+      status: 'processing',
+      encodingProgress: 0,
+      encodingStage: 'Queued for retry',
+      encodingError: null,
+      encodingLog: [],
+    });
 
-    startEncodingPipeline(video._id.toString(), video.originalPath, video.owner.toString());
-    res.json({ message: 'Encoding retried', videoId: video._id });
+    startEncodingPipeline(String(video.id), video.original_path, String(video.owner_id));
+    res.json({ message: 'Encoding retried', videoId: String(video.id) });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -83,16 +134,16 @@ router.post('/jobs/:id/retry', protect, requireAdmin, async (req: AuthRequest, r
 // ── Thumbnail generation ──────────────────────────────────────────────────────
 router.post('/thumbnails/:id/generate', protect, requireAdmin, async (req: AuthRequest, res) => {
   try {
-    const video = await Video.findById(req.params.id);
+    const video = await findVideoById(req.params.id);
     if (!video) return res.status(404).json({ error: 'Video not found' });
-    if (req.user!.role !== 'admin' && video.owner.toString() !== req.user!._id.toString()) {
+    if (req.user!.role !== 'admin' && String(video.owner_id) !== req.user!._id) {
       return res.status(403).json({ error: 'Forbidden' });
     }
-    if (!video.originalPath || !fs.existsSync(video.originalPath)) {
+    if (!video.original_path || !fs.existsSync(video.original_path)) {
       return res.status(400).json({ error: 'Original video file not found' });
     }
 
-    const thumbnails = await generateThumbnailOptions(video._id.toString(), video.originalPath);
+    const thumbnails = await generateThumbnailOptions(String(video.id), video.original_path);
     res.json({ thumbnails });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -104,13 +155,20 @@ router.post('/thumbnails/:id/select', protect, requireAdmin, async (req: AuthReq
     const { thumbnailPath } = req.body;
     if (!thumbnailPath) return res.status(400).json({ error: 'thumbnailPath required' });
 
-    const video = await Video.findById(req.params.id);
+    const video = await findVideoById(req.params.id);
     if (!video) return res.status(404).json({ error: 'Video not found' });
-    if (req.user!.role !== 'admin' && video.owner.toString() !== req.user!._id.toString()) {
+    if (req.user!.role !== 'admin' && String(video.owner_id) !== req.user!._id) {
       return res.status(403).json({ error: 'Forbidden' });
     }
 
-    await updateVideoThumbnail(video._id.toString(), thumbnailPath);
+    // Writes through `updateVideo` rather than encoder.ts's `updateVideoThumbnail`
+    // so this route doesn't depend on that helper surviving the encoder rewrite.
+    // The rel -> abs conversion it did is kept: `generateThumbnailOptions` hands
+    // the client paths relative to the storage base, but the column stores
+    // absolute ones, and `toUrl()` in videos.ts relies on that.
+    await updateVideo(req.params.id, {
+      thumbnailPath: path.join(storageBase(), thumbnailPath),
+    });
     res.json({ message: 'Thumbnail updated', thumbnailPath });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
