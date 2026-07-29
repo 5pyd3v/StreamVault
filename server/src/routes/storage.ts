@@ -3,10 +3,13 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import Video from '../models/Video.js';
-import { protect, AuthRequest } from '../middleware/auth.js';
+import { protect, requireAdmin, AuthRequest } from '../middleware/auth.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
+
+// Site-wide storage aggregates are ops data — admin only (matches admin.ts).
+router.use(protect, requireAdmin);
 
 function getUploadsDir(): string {
   return process.env.STORAGE_LOCAL_PATH
@@ -24,7 +27,7 @@ function dirSize(dirPath: string): number {
   return total;
 }
 
-router.get('/stats', protect, async (_req: AuthRequest, res) => {
+router.get('/stats', async (_req: AuthRequest, res) => {
   try {
     const [agg] = await Video.aggregate([
       { $group: { _id: null, totalSize: { $sum: '$sizeBytes' }, count: { $sum: 1 } } },
@@ -43,7 +46,7 @@ router.get('/stats', protect, async (_req: AuthRequest, res) => {
   }
 });
 
-router.get('/largest', protect, async (_req, res) => {
+router.get('/largest', async (_req, res) => {
   try {
     const videos = await Video.find({ status: 'published' })
       .select('title sizeBytes thumbnailPath')

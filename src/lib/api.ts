@@ -76,6 +76,34 @@ export interface ApiVideo {
   downloadUrl?: string;
 }
 
+/**
+ * Live channel as returned by the *public* endpoints
+ * (`GET /api/live/channels/public`, `GET /api/live/channels/:slug`).
+ * Never contains the stream key. `hlsUrl` is only populated while `status === 'live'`.
+ */
+export interface ApiLiveChannel {
+  _id: string;
+  name: string;
+  slug: string;
+  description: string;
+  category: string;
+  posterUrl: string;
+  status: 'offline' | 'starting' | 'live' | 'error';
+  liveStartedAt?: string | null;
+  hlsUrl: string;
+}
+
+/** Admin-facing channel shape — the full document, still without the stream key. */
+export interface ApiLiveChannelAdmin extends ApiLiveChannel {
+  owner?: { _id: string; name: string; email: string } | string;
+  rtmpApp: string;
+  isEnabled: boolean;
+  recordEnabled: boolean;
+  viewerCount: number;
+  lastError?: string;
+  createdAt: string;
+}
+
 export interface UploadInitResponse {
   uploadId: string;
   totalChunks: number;
@@ -130,6 +158,42 @@ export const videosApi = {
   delete: (id: string) => del<{ message: string }>(`/videos/${id}`),
   stats: () => get<{ total: number; totalSize: number; totalViews: number }>('/videos/meta/stats'),
 };
+
+// ── Live channels API ─────────────────────────────────────────────────────────
+// Public reads (any authenticated role) — used by HomePage / LiveTvPage / player.
+export const liveApi = {
+  /** Every enabled channel, `hlsUrl` filled in for the ones currently broadcasting. */
+  public: () => get<ApiLiveChannel[]>('/live/channels/public'),
+  /** Single channel by slug. */
+  get: (slug: string) => get<ApiLiveChannel>(`/live/channels/${encodeURIComponent(slug)}`),
+};
+
+// Admin-only channel management (server enforces protect + requireAdmin).
+export const liveAdminApi = {
+  list: () => get<ApiLiveChannelAdmin[]>('/live/channels'),
+  /** The only response that hands back the raw stream key without an explicit reveal. */
+  create: (body: { name: string; description?: string; category?: string; recordEnabled?: boolean }) =>
+    post<ApiLiveChannelAdmin & { streamKey: string; rtmpUrl: string }>('/live/channels', body),
+  reveal: (id: string) => get<{ streamKey: string; rtmpUrl: string }>(`/live/channels/${id}/reveal`),
+  update: (id: string, body: { name?: string; description?: string; category?: string; recordEnabled?: boolean; isEnabled?: boolean }) =>
+    patch<ApiLiveChannelAdmin>(`/live/channels/${id}`, body),
+  regenerateKey: (id: string) =>
+    post<{ streamKey: string; rtmpUrl: string; stopped: boolean }>(`/live/channels/${id}/regenerate-key`),
+  stop: (id: string) => post<{ message: string; stopped: boolean }>(`/live/channels/${id}/stop`),
+  /**
+   * Upload (or replace) the channel poster — multipart, field name "poster".
+   * Overrides any frame the server auto-captured when the channel went live.
+   */
+  uploadPoster: (id: string, file: File) => {
+    const form = new FormData();
+    form.append('poster', file);
+    return req<ApiLiveChannelAdmin>('POST', `/live/channels/${id}/poster`, form, true);
+  },
+  remove: (id: string) => del<{ message: string }>(`/live/channels/${id}`),
+};
+
+/** Stable per-channel live playlist URL (mirrors the server's `publicShape`). */
+export const liveHlsUrlFor = (channelId: string) => `/uploads/hls/live/${channelId}/master.m3u8`;
 
 // ── Upload API + chunker ──────────────────────────────────────────────────────
 const CHUNK_SIZE = 5 * 1024 * 1024; // 5 MB

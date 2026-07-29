@@ -41,6 +41,10 @@ export interface IVideo extends Document {
   views: number;
   encodingLog: string[];
 
+  // Origin
+  sourceType: 'upload' | 'live-recording';
+  sourceChannel?: mongoose.Types.ObjectId;
+
   // Encoding job
   encodingJobId?: string;
   encodingProgress: number;
@@ -86,6 +90,9 @@ const VideoSchema = new Schema<IVideo>({
   folder:          { type: String, default: 'root' },
   views:           { type: Number, default: 0 },
   encodingLog:     [{ type: String }],
+
+  sourceType:      { type: String, enum: ['upload', 'live-recording'], default: 'upload' },
+  sourceChannel:   { type: Schema.Types.ObjectId, ref: 'LiveChannel' },
 
   encodingJobId:   String,
   encodingProgress:{ type: Number, default: 0 },

@@ -48,12 +48,21 @@ function addUrls(v: any) {
 
 const router = express.Router();
 
-// ── List videos (owned) ───────────────────────────────────────────────────────
+// ── List videos ───────────────────────────────────────────────────────────────
+// Admins get the whole collection (they need drafts/failures for the management
+// views). Everyone else gets the *published catalogue* — every published video,
+// regardless of owner, and nothing else. This replaces the old owner-scoping:
+// now that only admins can upload, scoping a viewer to their own videos would
+// hand them an empty library instead of the catalogue.
+//
+// The `status` query param is honoured for admins only; a non-admin asking for
+// `?status=failed` still gets published-only rather than overriding the filter.
 router.get('/', protect, async (req: AuthRequest, res) => {
   try {
     const { status, search, folder, page = 1, limit = 50, sort = '-createdAt' } = req.query;
-    const query: any = req.user!.role === 'admin' ? {} : { owner: req.user!._id };
-    if (status && status !== 'all') query.status = status;
+    const isAdmin = req.user!.role === 'admin';
+    const query: any = isAdmin ? {} : { status: 'published' };
+    if (isAdmin && status && status !== 'all') query.status = status;
     if (folder) query.folder = folder;
     if (search) query.$text = { $search: String(search) };
 
@@ -71,11 +80,16 @@ router.get('/', protect, async (req: AuthRequest, res) => {
 });
 
 // ── Get single video ──────────────────────────────────────────────────────────
+// Mirrors the list rule so a deep link into the player resolves: a non-admin may
+// fetch any *published* video (that's the catalogue they browse), or one they
+// own. Anything still draft/processing/failed/archived stays admin-or-owner only.
 router.get('/:id', protect, async (req: AuthRequest, res) => {
   try {
     const video = await Video.findById(req.params.id).populate('owner', 'name email');
     if (!video) return res.status(404).json({ error: 'Video not found' });
-    if (req.user!.role !== 'admin' && video.owner._id.toString() !== req.user!._id.toString()) {
+    const isAdmin = req.user!.role === 'admin';
+    const isOwner = video.owner._id.toString() === req.user!._id.toString();
+    if (!isAdmin && !isOwner && video.status !== 'published') {
       return res.status(403).json({ error: 'Forbidden' });
     }
     video.views += 1;

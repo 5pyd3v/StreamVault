@@ -5,7 +5,7 @@ import fs from 'fs';
 import crypto from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import { fileURLToPath } from 'url';
-import { protect, AuthRequest } from '../middleware/auth.js';
+import { protect, requireAdmin, AuthRequest } from '../middleware/auth.js';
 import UploadSession from '../models/UploadSession.js';
 import Video from '../models/Video.js';
 import { startEncodingPipeline } from '../services/encoder.js';
@@ -44,8 +44,13 @@ const upload = multer({
 
 const router = express.Router();
 
+// Ingest is an admin-only surface: regular users consume the catalogue, they
+// never contribute to it. Every route below is `protect` + `requireAdmin`, and
+// on /chunk the guard deliberately runs *before* multer so a rejected upload
+// never lands a byte on disk.
+
 // ── Init upload session ───────────────────────────────────────────────────────
-router.post('/init', protect, async (req: AuthRequest, res) => {
+router.post('/init', protect, requireAdmin, async (req: AuthRequest, res) => {
   try {
     const { filename, totalSize, mimeType } = req.body;
     if (!filename || !totalSize) return res.status(400).json({ error: 'filename and totalSize required' });
@@ -99,7 +104,7 @@ router.post('/init', protect, async (req: AuthRequest, res) => {
 });
 
 // ── Upload single chunk ───────────────────────────────────────────────────────
-router.post('/chunk', protect, upload.single('chunk'), async (req: AuthRequest, res) => {
+router.post('/chunk', protect, requireAdmin, upload.single('chunk'), async (req: AuthRequest, res) => {
   try {
     const { uploadId, chunkIndex, totalChunks, hash } = req.body;
     if (!uploadId || chunkIndex === undefined || !req.file) {
@@ -152,7 +157,7 @@ router.post('/chunk', protect, upload.single('chunk'), async (req: AuthRequest, 
 });
 
 // ── Merge chunks + start pipeline ────────────────────────────────────────────
-router.post('/merge', protect, async (req: AuthRequest, res) => {
+router.post('/merge', protect, requireAdmin, async (req: AuthRequest, res) => {
   try {
     const { uploadId } = req.body;
     const session = await UploadSession.findOne({ uploadId, owner: req.user!._id });
@@ -242,7 +247,7 @@ router.post('/merge', protect, async (req: AuthRequest, res) => {
 });
 
 // ── Get session status ────────────────────────────────────────────────────────
-router.get('/status/:uploadId', protect, async (req: AuthRequest, res) => {
+router.get('/status/:uploadId', protect, requireAdmin, async (req: AuthRequest, res) => {
   try {
     const session = await UploadSession.findOne({ uploadId: req.params.uploadId, owner: req.user!._id });
     if (!session) return res.status(404).json({ error: 'Not found' });

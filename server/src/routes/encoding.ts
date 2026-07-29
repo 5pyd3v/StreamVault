@@ -1,13 +1,23 @@
 import express from 'express';
 import fs from 'fs';
 import Video from '../models/Video.js';
-import { protect, AuthRequest } from '../middleware/auth.js';
+import { protect, requireAdmin, AuthRequest } from '../middleware/auth.js';
 import { startEncodingPipeline, generateThumbnailOptions, updateVideoThumbnail } from '../services/encoder.js';
 
 const router = express.Router();
 
+// Everything in this router is admin-only.
+//
+// The owner-or-admin checks below used to be the boundary, but now that only
+// admins can upload, "owner" and "admin" have converged — except for videos
+// owned by non-admins from *before* uploads were locked down, which would
+// otherwise still let a regular user kick off FFmpeg work. The per-route
+// ownership checks are kept as defence in depth for editor-owned content.
+// This also closes GET /jobs/:id, which had no ownership check at all and
+// leaked the title / encoding log / failure reason of any video by id.
+
 // ── Active encoding jobs ──────────────────────────────────────────────────────
-router.get('/jobs', protect, async (req: AuthRequest, res) => {
+router.get('/jobs', protect, requireAdmin, async (req: AuthRequest, res) => {
   try {
     const match: any = { status: { $in: ['processing', 'encoding'] } };
     if (req.user!.role !== 'admin') match.owner = req.user!._id;
@@ -24,7 +34,7 @@ router.get('/jobs', protect, async (req: AuthRequest, res) => {
 });
 
 // ── Single job status ─────────────────────────────────────────────────────────
-router.get('/jobs/:id', protect, async (req: AuthRequest, res) => {
+router.get('/jobs/:id', protect, requireAdmin, async (req: AuthRequest, res) => {
   try {
     const video = await Video.findById(req.params.id)
       .select('title encodingProgress encodingStage encodingLog encodingError status streams');
@@ -36,7 +46,7 @@ router.get('/jobs/:id', protect, async (req: AuthRequest, res) => {
 });
 
 // ── Retry failed encoding ─────────────────────────────────────────────────────
-router.post('/jobs/:id/retry', protect, async (req: AuthRequest, res) => {
+router.post('/jobs/:id/retry', protect, requireAdmin, async (req: AuthRequest, res) => {
   try {
     const video = await Video.findById(req.params.id);
     if (!video) return res.status(404).json({ error: 'Not found' });
@@ -71,7 +81,7 @@ router.post('/jobs/:id/retry', protect, async (req: AuthRequest, res) => {
 });
 
 // ── Thumbnail generation ──────────────────────────────────────────────────────
-router.post('/thumbnails/:id/generate', protect, async (req: AuthRequest, res) => {
+router.post('/thumbnails/:id/generate', protect, requireAdmin, async (req: AuthRequest, res) => {
   try {
     const video = await Video.findById(req.params.id);
     if (!video) return res.status(404).json({ error: 'Video not found' });
@@ -89,7 +99,7 @@ router.post('/thumbnails/:id/generate', protect, async (req: AuthRequest, res) =
   }
 });
 
-router.post('/thumbnails/:id/select', protect, async (req: AuthRequest, res) => {
+router.post('/thumbnails/:id/select', protect, requireAdmin, async (req: AuthRequest, res) => {
   try {
     const { thumbnailPath } = req.body;
     if (!thumbnailPath) return res.status(400).json({ error: 'thumbnailPath required' });

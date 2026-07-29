@@ -1,5 +1,16 @@
 import { useState, useRef, useCallback, useEffect } from "react";
-import Hls from "hls.js";
+import {
+  Routes, Route, Navigate, NavLink, Link, Outlet,
+  useNavigate, useParams, useLocation,
+} from "react-router";
+import RequireAdmin from "./routes/RequireAdmin";
+import RequireAuth from "./routes/RequireAuth";
+import HlsPlayer from "./components/HlsPlayer";
+import PosterCard from "./components/PosterCard";
+import HomePage from "./pages/HomePage";
+import LiveTvPage from "./pages/LiveTvPage";
+import LiveChannelPlayerPage from "./pages/LiveChannelPlayerPage";
+import LiveChannelsAdminPage from "./pages/LiveChannelsAdminPage";
 import { connectSocket, disconnectSocket, getSocket, watchVideo } from "../lib/socket";
 import type { EncodingProgressEvent } from "../lib/socket";
 import { authApi, encodingApi, checkHealth, uploadFileChunked } from "../lib/api";
@@ -7,7 +18,7 @@ import type { ApiVideo, AuthUser } from "../lib/api";
 import { motion, AnimatePresence } from "motion/react";
 import {
   LayoutDashboard, Upload, Film, Settings, Shield, ChevronRight,
-  Play, Pause, SkipForward, Volume2, Maximize2, Eye, Download,
+  Play, Pause, Eye, Download,
   Trash2, MoreVertical, Search, Bell, User,
   TrendingUp, HardDrive, Zap, Clock, CheckCircle, AlertCircle,
   Loader2, RefreshCw, Plus, Grid3X3, List, X,
@@ -18,7 +29,7 @@ import {
   Check, Layers, GitBranch, UploadCloud, FileVideo,
   Gauge, Radio, Signal, MemoryStick, AlertTriangle, Users,
   ShieldCheck, Mail, Eye as EyeIcon, EyeOff, ArrowLeft,
-  Github, Chrome
+  Github, Chrome, Home, Tv, Menu, LogOut
 } from "lucide-react";
 import {
   AreaChart, Area, BarChart, Bar, XAxis, YAxis, CartesianGrid,
@@ -27,7 +38,6 @@ import {
 } from "recharts";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
-type Page = "auth" | "dashboard" | "upload" | "library" | "player" | "encoding" | "storage" | "settings" | "admin";
 type AuthView = "login" | "register";
 type ThumbnailOption = { path: string; url: string; timestamp: number };
 
@@ -105,11 +115,11 @@ function StatusBadge({ status }: { status: string }) {
   const map: Record<string, { label: string; cls: string }> = {
     published: { label: "Published", cls: "bg-emerald-500/12 text-emerald-400 border-emerald-500/25" },
     draft:     { label: "Draft",     cls: "bg-amber-500/12 text-amber-400 border-amber-500/25" },
-    processing:{ label: "Processing",cls: "bg-blue-500/12 text-blue-400 border-blue-500/25" },
+    processing:{ label: "Processing",cls: "bg-white/10 text-white/75 border-white/20" },
     failed:    { label: "Failed",    cls: "bg-red-500/12 text-red-400 border-red-500/25" },
     archived:  { label: "Archived",  cls: "bg-zinc-500/12 text-zinc-400 border-zinc-500/25" },
-    encoding:  { label: "Encoding",  cls: "bg-violet-500/12 text-violet-400 border-violet-500/25" },
-    uploading: { label: "Uploading", cls: "bg-blue-500/12 text-blue-400 border-blue-500/25" },
+    encoding:  { label: "Encoding",  cls: "bg-[var(--sv-accent-soft)] text-[var(--sv-accent-text)] border-[var(--sv-accent-border)]" },
+    uploading: { label: "Uploading", cls: "bg-white/10 text-white/75 border-white/20" },
     paused:    { label: "Paused",    cls: "bg-amber-500/12 text-amber-400 border-amber-500/25" },
     queued:    { label: "Queued",    cls: "bg-zinc-500/12 text-zinc-400 border-zinc-500/25" },
     done:      { label: "Done",      cls: "bg-emerald-500/12 text-emerald-400 border-emerald-500/25" },
@@ -122,9 +132,11 @@ function StatusBadge({ status }: { status: string }) {
   return <span className={`text-[10px] font-semibold tracking-widest uppercase px-2 py-0.5 rounded-md border font-mono ${cls}`}>{label}</span>;
 }
 
-function MetricCard({ icon: Icon, label, value, sub, delta, color = "blue" }: { icon: React.ElementType; label: string; value: string; sub?: string; delta?: string; color?: string }) {
-  const colors: Record<string, string> = { blue: "#2563eb", indigo: "#4f46e5", cyan: "#06b6d4", emerald: "#10b981", amber: "#f59e0b", red: "#ef4444" };
-  const c = colors[color] ?? colors.blue;
+function MetricCard({ icon: Icon, label, value, sub, delta, color = "accent" }: { icon: React.ElementType; label: string; value: string; sub?: string; delta?: string; color?: string }) {
+  // Netflix keeps its chrome monochrome and spends colour sparingly, so the
+  // tile ramp is brand red first, then neutrals. No blue/indigo/cyan.
+  const colors: Record<string, string> = { accent: "#e50914", crimson: "#b20710", neutral: "#d2d2d2", emerald: "#10b981", amber: "#f59e0b", red: "#ef4444" };
+  const c = colors[color] ?? colors.accent;
   return (
     <GlassCard className="p-5">
       <div className="flex items-start justify-between mb-4">
@@ -140,7 +152,7 @@ function MetricCard({ icon: Icon, label, value, sub, delta, color = "blue" }: { 
   );
 }
 
-function ProgressBar({ value, className = "", color = "#2563eb" }: { value: number; className?: string; color?: string }) {
+function ProgressBar({ value, className = "", color = "var(--sv-accent)" }: { value: number; className?: string; color?: string }) {
   return (
     <div className={`h-1.5 rounded-full bg-white/[0.07] overflow-hidden ${className}`}>
       <motion.div className="h-full rounded-full" style={{ background: color }}
@@ -149,7 +161,7 @@ function ProgressBar({ value, className = "", color = "#2563eb" }: { value: numb
   );
 }
 
-function ProgressRing({ pct, size = 52, stroke = 4, color = "#2563eb", label }: { pct: number; size?: number; stroke?: number; color?: string; label?: string }) {
+function ProgressRing({ pct, size = 52, stroke = 4, color = "var(--sv-accent)", label }: { pct: number; size?: number; stroke?: number; color?: string; label?: string }) {
   const r = (size - stroke * 2) / 2;
   const circ = 2 * Math.PI * r;
   const offset = circ - (pct / 100) * circ;
@@ -157,9 +169,11 @@ function ProgressRing({ pct, size = 52, stroke = 4, color = "#2563eb", label }: 
     <div className="relative inline-flex items-center justify-center">
       <svg width={size} height={size} style={{ transform: "rotate(-90deg)" }}>
         <circle cx={size / 2} cy={size / 2} r={r} stroke="rgba(255,255,255,0.07)" strokeWidth={stroke} fill="none" />
-        <circle cx={size / 2} cy={size / 2} r={r} stroke={color} strokeWidth={stroke} fill="none"
+        {/* `stroke` is set through style, not the SVG attribute, so callers can
+            pass a `var(--sv-*)` token instead of a literal hex. */}
+        <circle cx={size / 2} cy={size / 2} r={r} strokeWidth={stroke} fill="none"
           strokeDasharray={circ} strokeDashoffset={offset} strokeLinecap="round"
-          style={{ transition: "stroke-dashoffset 0.7s ease" }} />
+          style={{ stroke: color, transition: "stroke-dashoffset 0.7s ease" }} />
       </svg>
       {label && <span className="absolute text-[10px] font-mono font-semibold text-white">{label}</span>}
     </div>
@@ -208,190 +222,154 @@ function AuthPage({ onLogin }: { onLogin: (user: AuthUser) => void }) {
     } finally { setLoading(false); }
   };
 
+  // Netflix-style auth surface: a moody near-black backdrop with a single red
+  // bloom, the wordmark top-left, and one centred card holding the form. No
+  // marketing panel, no feature bullets, no compliance claims — the sign-in
+  // page's only job is the form. Behaviour below is untouched.
   return (
-    <div className="min-h-screen flex" style={{ background: "#080b14", fontFamily: "'Inter', sans-serif" }}>
-      {/* Left panel — branding */}
-      <div className="hidden lg:flex flex-col justify-between w-[480px] flex-shrink-0 relative overflow-hidden p-12"
-        style={{ background: "linear-gradient(135deg, #0d1117 0%, #0a0e1a 50%, #080b14 100%)" }}>
-        {/* Glow orbs */}
-        <div className="absolute top-1/4 left-1/3 w-72 h-72 rounded-full pointer-events-none"
-          style={{ background: "radial-gradient(circle, rgba(37,99,235,0.18) 0%, transparent 70%)", filter: "blur(40px)" }} />
-        <div className="absolute bottom-1/3 right-1/4 w-56 h-56 rounded-full pointer-events-none"
-          style={{ background: "radial-gradient(circle, rgba(79,70,229,0.14) 0%, transparent 70%)", filter: "blur(40px)" }} />
-        <div className="absolute inset-0 pointer-events-none" style={{ backgroundImage: "radial-gradient(rgba(255,255,255,0.03) 1px, transparent 1px)", backgroundSize: "28px 28px" }} />
+    <div className="relative min-h-screen overflow-hidden" style={{ background: "var(--sv-bg-deep)", fontFamily: "'Inter', sans-serif" }}>
+      {/* Backdrop: deep vignette + one warm red bloom, no imagery. */}
+      <div aria-hidden className="pointer-events-none absolute inset-0"
+        style={{ background: "radial-gradient(125% 95% at 50% -10%, #2b0609 0%, #150809 40%, #000000 100%)" }} />
+      <div aria-hidden className="pointer-events-none absolute -top-48 left-1/2 h-[560px] w-[860px] -translate-x-1/2 rounded-full"
+        style={{ background: "radial-gradient(circle, var(--sv-accent-soft) 0%, transparent 68%)", filter: "blur(80px)" }} />
+      <div aria-hidden className="pointer-events-none absolute inset-0"
+        style={{ background: "linear-gradient(to bottom, rgba(0,0,0,0.6) 0%, rgba(0,0,0,0.15) 35%, rgba(0,0,0,0.88) 100%)" }} />
 
-        <div className="relative">
-          <div className="flex items-center gap-3 mb-16">
-            <div className="w-10 h-10 rounded-2xl flex items-center justify-center" style={{ background: "linear-gradient(135deg, #2563eb, #4f46e5)" }}>
-              <Play size={16} fill="white" className="text-white ml-0.5" />
+      <div className="relative flex min-h-screen flex-col">
+        {/* Wordmark */}
+        <header className="flex-shrink-0 px-6 pt-6 sm:px-12 sm:pt-8">
+          <div className="flex items-center gap-2.5">
+            <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg" style={{ background: "var(--sv-accent)" }}>
+              <Play size={14} fill="white" className="ml-0.5 text-white" />
             </div>
-            <span className="text-xl font-bold text-white" style={{ fontFamily: "'Outfit', sans-serif" }}>StreamVault</span>
+            <span className="text-xl font-extrabold tracking-tight text-[var(--sv-accent)]" style={{ fontFamily: "'Outfit', sans-serif" }}>
+              StreamVault
+            </span>
           </div>
+        </header>
 
-          <div className="space-y-6">
-            <h1 className="text-4xl font-bold text-white leading-tight" style={{ fontFamily: "'Outfit', sans-serif" }}>
-              Enterprise video<br />at any scale.
-            </h1>
-            <p className="text-white/45 text-base leading-relaxed">
-              Chunk-based uploads, adaptive HLS streaming,<br />real-time encoding — all in one platform.
-            </p>
-          </div>
+        {/* Form card */}
+        <main className="flex flex-1 items-center justify-center px-4 py-10 sm:py-14">
+          <div className="w-full max-w-[420px] rounded-xl border border-white/[0.06] px-6 py-9 sm:px-11 sm:py-12"
+            style={{ background: "rgba(0,0,0,0.72)", backdropFilter: "blur(6px)", boxShadow: "0 24px 70px rgba(0,0,0,0.6)" }}>
+            <AnimatePresence mode="wait">
 
-          <div className="mt-12 space-y-4">
-            {[
-              { icon: UploadCloud, label: "Resumable uploads up to 100 GB", color: "#2563eb" },
-              { icon: Radio, label: "Adaptive bitrate HLS streaming", color: "#4f46e5" },
-              { icon: Cpu, label: "Parallel FFmpeg encoding pipeline", color: "#06b6d4" },
-              { icon: ShieldCheck, label: "SHA-256 chunk verification", color: "#10b981" },
-            ].map(f => (
-              <div key={f.label} className="flex items-center gap-3">
-                <div className="p-2 rounded-xl flex-shrink-0" style={{ background: `${f.color}18` }}>
-                  <f.icon size={15} style={{ color: f.color }} />
-                </div>
-                <span className="text-sm text-white/50">{f.label}</span>
-              </div>
-            ))}
-          </div>
-        </div>
+              {/* LOGIN */}
+              {view === "login" && (
+                <motion.div key="login" initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }} transition={{ duration: 0.22 }}>
+                  <h1 className="mb-7 text-[28px] font-bold leading-tight text-white" style={{ fontFamily: "'Outfit', sans-serif" }}>Sign In</h1>
 
-        <p className="relative text-xs text-white/20 font-mono">© 2025 StreamVault Inc. · SOC 2 Type II · GDPR Compliant</p>
-      </div>
+                  {error && (
+                    <div className="mb-4 rounded-md px-4 py-3 text-sm font-medium text-white" style={{ background: "var(--sv-accent)" }}>{error}</div>
+                  )}
+                  {success && (
+                    <div className="mb-4 rounded-md border border-emerald-500/25 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-400">{success}</div>
+                  )}
 
-      {/* Right panel — form */}
-      <div className="flex-1 flex items-center justify-center p-8">
-        <div className="w-full max-w-md">
-          <AnimatePresence mode="wait">
-
-            {/* LOGIN */}
-            {view === "login" && (
-              <motion.div key="login" initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }} transition={{ duration: 0.22 }}>
-                <div className="mb-8">
-                  <h2 className="text-2xl font-bold text-white mb-1.5" style={{ fontFamily: "'Outfit', sans-serif" }}>Welcome back</h2>
-                  <p className="text-sm text-white/40">Sign in to your StreamVault account</p>
-                </div>
-
-                {error && (
-                  <div className="mb-4 px-4 py-3 rounded-xl bg-red-500/10 border border-red-500/20 text-sm text-red-400">{error}</div>
-                )}
-                {success && (
-                  <div className="mb-4 px-4 py-3 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-sm text-emerald-400">{success}</div>
-                )}
-
-                <div className="space-y-4">
-                  <div>
-                    <label className="text-xs text-white/40 font-mono mb-1.5 block">Email address</label>
+                  <div className="space-y-4">
                     <div className="relative">
-                      <Mail size={14} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-white/25" />
+                      <Mail size={15} className="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-white/30" />
                       <input type="email" value={email} onChange={e => setEmail(e.target.value)}
                         onKeyDown={e => e.key === "Enter" && handleLogin()}
-                        placeholder="you@company.com"
-                        className="w-full pl-10 pr-4 py-3 rounded-xl bg-white/5 border border-white/10 text-sm text-white placeholder-white/20 focus:outline-none focus:border-blue-500/50 focus:bg-white/7 transition-all" />
-                    </div>
-                  </div>
-                  <div>
-                    <div className="flex items-center justify-between mb-1.5">
-                      <label className="text-xs text-white/40 font-mono">Password</label>
+                        placeholder="Email"
+                        className="w-full rounded-md border border-white/10 bg-white/[0.07] py-3.5 pl-11 pr-4 text-sm text-white placeholder-white/40 transition-colors focus:border-[var(--sv-accent-border)] focus:bg-white/[0.1] focus:outline-none" />
                     </div>
                     <div className="relative">
-                      <Lock size={14} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-white/25" />
+                      <Lock size={15} className="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-white/30" />
                       <input type={showPw ? "text" : "password"} value={password} onChange={e => setPassword(e.target.value)}
                         onKeyDown={e => e.key === "Enter" && handleLogin()}
-                        placeholder="••••••••••••"
-                        className="w-full pl-10 pr-10 py-3 rounded-xl bg-white/5 border border-white/10 text-sm text-white placeholder-white/25 focus:outline-none focus:border-blue-500/50 focus:bg-white/7 transition-all" />
-                      <button onClick={() => setShowPw(p => !p)} className="absolute right-3.5 top-1/2 -translate-y-1/2 text-white/25 hover:text-white/50 transition-colors">
-                        {showPw ? <EyeOff size={14} /> : <EyeIcon size={14} />}
+                        placeholder="Password"
+                        className="w-full rounded-md border border-white/10 bg-white/[0.07] py-3.5 pl-11 pr-11 text-sm text-white placeholder-white/40 transition-colors focus:border-[var(--sv-accent-border)] focus:bg-white/[0.1] focus:outline-none" />
+                      <button type="button" onClick={() => setShowPw(p => !p)} aria-label={showPw ? "Hide password" : "Show password"}
+                        className="absolute right-4 top-1/2 -translate-y-1/2 text-white/35 transition-colors hover:text-white">
+                        {showPw ? <EyeOff size={15} /> : <EyeIcon size={15} />}
                       </button>
                     </div>
+                    <button onClick={handleLogin} disabled={loading}
+                      className="flex w-full items-center justify-center gap-2 rounded-md bg-[var(--sv-accent)] py-3.5 text-sm font-semibold text-white transition-colors hover:bg-[var(--sv-accent-hover)] active:scale-[0.99] disabled:opacity-60">
+                      {loading && <Loader2 size={15} className="animate-spin" />}
+                      Sign In
+                    </button>
                   </div>
-                  <button onClick={handleLogin} disabled={loading}
-                    className="w-full py-3 rounded-xl font-semibold text-sm text-white transition-all hover:opacity-90 active:scale-[0.98] disabled:opacity-50 flex items-center justify-center gap-2"
-                    style={{ background: "linear-gradient(135deg, #2563eb, #4f46e5)" }}>
-                    {loading && <Loader2 size={14} className="animate-spin" />}
-                    Sign in
-                  </button>
-                </div>
 
-                <p className="text-center text-sm text-white/35 mt-6">
-                  {"Don't have an account?"}{" "}
-                  <button onClick={() => goTo("register")} className="text-blue-400 hover:text-blue-300 font-medium transition-colors">Create one free</button>
-                </p>
-              </motion.div>
-            )}
-
-            {/* REGISTER */}
-            {view === "register" && (
-              <motion.div key="register" initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }} transition={{ duration: 0.22 }}>
-                <button onClick={() => goTo("login")} className="flex items-center gap-1.5 text-xs text-white/35 hover:text-white/60 transition-colors mb-8">
-                  <ArrowLeft size={13} />Back to sign in
-                </button>
-                <div className="mb-8">
-                  <h2 className="text-2xl font-bold text-white mb-1.5" style={{ fontFamily: "'Outfit', sans-serif" }}>Create account</h2>
-                  <p className="text-sm text-white/40">Get started — no credit card required</p>
-                </div>
-
-                {error && (
-                  <div className="mb-4 px-4 py-3 rounded-xl bg-red-500/10 border border-red-500/20 text-sm text-red-400">{error}</div>
-                )}
-                {success && (
-                  <div className="mb-4 px-4 py-3 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-sm text-emerald-400">{success}</div>
-                )}
-
-                <div className="space-y-4">
-                  <div>
-                    <label className="text-xs text-white/40 font-mono mb-1.5 block">Full name</label>
-                    <input value={name} onChange={e => setName(e.target.value)} placeholder="Alex Chen"
-                      className="w-full px-4 py-3 rounded-xl bg-white/5 border border-white/10 text-sm text-white placeholder-white/20 focus:outline-none focus:border-blue-500/50 transition-all" />
-                  </div>
-                  <div>
-                    <label className="text-xs text-white/40 font-mono mb-1.5 block">Work email</label>
-                    <input type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="you@company.com"
-                      className="w-full px-4 py-3 rounded-xl bg-white/5 border border-white/10 text-sm text-white placeholder-white/20 focus:outline-none focus:border-blue-500/50 transition-all" />
-                  </div>
-                  <div>
-                    <label className="text-xs text-white/40 font-mono mb-1.5 block">Company <span className="text-white/20">(optional)</span></label>
-                    <input value={org} onChange={e => setOrg(e.target.value)} placeholder="Acme Corp"
-                      className="w-full px-4 py-3 rounded-xl bg-white/5 border border-white/10 text-sm text-white placeholder-white/20 focus:outline-none focus:border-blue-500/50 transition-all" />
-                  </div>
-                  <div>
-                    <label className="text-xs text-white/40 font-mono mb-1.5 block">Password</label>
-                    <div className="relative">
-                      <Lock size={14} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-white/25" />
-                      <input type={showPw ? "text" : "password"} value={password} onChange={e => setPassword(e.target.value)}
-                        placeholder="Min. 8 characters"
-                        className="w-full pl-10 pr-10 py-3 rounded-xl bg-white/5 border border-white/10 text-sm text-white placeholder-white/20 focus:outline-none focus:border-blue-500/50 transition-all" />
-                      <button onClick={() => setShowPw(p => !p)} className="absolute right-3.5 top-1/2 -translate-y-1/2 text-white/25 hover:text-white/50 transition-colors">
-                        {showPw ? <EyeOff size={14} /> : <EyeIcon size={14} />}
-                      </button>
-                    </div>
-                  </div>
-                  <button onClick={handleRegister} disabled={loading}
-                    className="w-full py-3 rounded-xl font-semibold text-sm text-white transition-all hover:opacity-90 disabled:opacity-50 flex items-center justify-center gap-2"
-                    style={{ background: "linear-gradient(135deg, #2563eb, #4f46e5)" }}>
-                    {loading && <Loader2 size={14} className="animate-spin" />}
-                    Create account
-                  </button>
-                  <p className="text-center text-xs text-white/25 leading-relaxed">
-                    By signing up you agree to our{" "}
-                    <span className="text-blue-400/70">Terms of Service</span> and{" "}
-                    <span className="text-blue-400/70">Privacy Policy</span>
+                  <p className="mt-8 text-sm text-white/45">
+                    {"New to StreamVault?"}{" "}
+                    <button onClick={() => goTo("register")} className="font-medium text-white transition-colors hover:underline">Create an account</button>
                   </p>
-                </div>
-                <p className="text-center text-sm text-white/35 mt-6">
-                  Already have an account?{" "}
-                  <button onClick={() => goTo("login")} className="text-blue-400 hover:text-blue-300 font-medium transition-colors">Sign in</button>
-                </p>
-              </motion.div>
-            )}
+                </motion.div>
+              )}
 
-          </AnimatePresence>
-        </div>
+              {/* REGISTER */}
+              {view === "register" && (
+                <motion.div key="register" initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }} transition={{ duration: 0.22 }}>
+                  <button onClick={() => goTo("login")} className="mb-6 flex items-center gap-1.5 text-xs text-white/40 transition-colors hover:text-white">
+                    <ArrowLeft size={13} />Back to sign in
+                  </button>
+                  <h1 className="mb-7 text-[28px] font-bold leading-tight text-white" style={{ fontFamily: "'Outfit', sans-serif" }}>Create Account</h1>
+
+                  {error && (
+                    <div className="mb-4 rounded-md px-4 py-3 text-sm font-medium text-white" style={{ background: "var(--sv-accent)" }}>{error}</div>
+                  )}
+                  {success && (
+                    <div className="mb-4 rounded-md border border-emerald-500/25 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-400">{success}</div>
+                  )}
+
+                  <div className="space-y-4">
+                    <div className="relative">
+                      <User size={15} className="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-white/30" />
+                      <input value={name} onChange={e => setName(e.target.value)} placeholder="Full name"
+                        className="w-full rounded-md border border-white/10 bg-white/[0.07] py-3.5 pl-11 pr-4 text-sm text-white placeholder-white/40 transition-colors focus:border-[var(--sv-accent-border)] focus:bg-white/[0.1] focus:outline-none" />
+                    </div>
+                    <div className="relative">
+                      <Mail size={15} className="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-white/30" />
+                      <input type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="Email"
+                        className="w-full rounded-md border border-white/10 bg-white/[0.07] py-3.5 pl-11 pr-4 text-sm text-white placeholder-white/40 transition-colors focus:border-[var(--sv-accent-border)] focus:bg-white/[0.1] focus:outline-none" />
+                    </div>
+                    <div className="relative">
+                      <Layers size={15} className="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-white/30" />
+                      <input value={org} onChange={e => setOrg(e.target.value)} placeholder="Organization (optional)"
+                        className="w-full rounded-md border border-white/10 bg-white/[0.07] py-3.5 pl-11 pr-4 text-sm text-white placeholder-white/40 transition-colors focus:border-[var(--sv-accent-border)] focus:bg-white/[0.1] focus:outline-none" />
+                    </div>
+                    <div className="relative">
+                      <Lock size={15} className="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-white/30" />
+                      <input type={showPw ? "text" : "password"} value={password} onChange={e => setPassword(e.target.value)}
+                        placeholder="Password"
+                        className="w-full rounded-md border border-white/10 bg-white/[0.07] py-3.5 pl-11 pr-11 text-sm text-white placeholder-white/40 transition-colors focus:border-[var(--sv-accent-border)] focus:bg-white/[0.1] focus:outline-none" />
+                      <button type="button" onClick={() => setShowPw(p => !p)} aria-label={showPw ? "Hide password" : "Show password"}
+                        className="absolute right-4 top-1/2 -translate-y-1/2 text-white/35 transition-colors hover:text-white">
+                        {showPw ? <EyeOff size={15} /> : <EyeIcon size={15} />}
+                      </button>
+                    </div>
+                    <button onClick={handleRegister} disabled={loading}
+                      className="flex w-full items-center justify-center gap-2 rounded-md bg-[var(--sv-accent)] py-3.5 text-sm font-semibold text-white transition-colors hover:bg-[var(--sv-accent-hover)] active:scale-[0.99] disabled:opacity-60">
+                      {loading && <Loader2 size={15} className="animate-spin" />}
+                      Create Account
+                    </button>
+                  </div>
+
+                  <p className="mt-8 text-sm text-white/45">
+                    Already have an account?{" "}
+                    <button onClick={() => goTo("login")} className="font-medium text-white transition-colors hover:underline">Sign in</button>
+                  </p>
+                </motion.div>
+              )}
+
+            </AnimatePresence>
+          </div>
+        </main>
+
+        <footer className="flex-shrink-0 px-6 pb-7 text-center sm:px-12">
+          <p className="font-mono text-[11px] text-white/25">© {new Date().getFullYear()} StreamVault</p>
+        </footer>
       </div>
     </div>
   );
 }
 
 // ─── Dashboard ────────────────────────────────────────────────────────────────
-function DashboardPage({ setPage, online }: { setPage: (p: Page) => void; online: boolean | null }) {
+function DashboardPage({ online }: { online: boolean | null }) {
+  const navigate = useNavigate();
   const [stats, setStats] = useState<{ total: number; totalSize: number; totalViews: number } | null>(null);
   const [encJobs, setEncJobs] = useState<ApiVideo[]>([]);
 
@@ -413,18 +391,18 @@ function DashboardPage({ setPage, online }: { setPage: (p: Page) => void; online
           <p className="text-sm text-white/35 mt-0.5">{new Date().toLocaleString()}</p>
         </div>
         <div className="flex items-center gap-3">
-          <button onClick={() => setPage("upload")}
+          <button onClick={() => navigate("/admin/upload")}
             className="flex items-center gap-2 px-4 py-2 rounded-xl text-white text-sm font-semibold hover:opacity-90 transition-all"
-            style={{ background: "linear-gradient(135deg, #2563eb, #4f46e5)" }}>
+            style={{ background: "var(--sv-accent)" }}>
             <Plus size={14} />New Upload
           </button>
         </div>
       </div>
 
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-        <MetricCard icon={Film} label="Total Videos" value={stats?.total != null ? stats.total.toLocaleString() : "0"} sub="across all folders" color="blue" />
-        <MetricCard icon={HardDrive} label="Storage Used" value={stats?.totalSize != null ? fmt2(stats.totalSize) : "0 MB"} sub="source files" color="indigo" />
-        <MetricCard icon={Zap} label="Bandwidth" value={stats?.totalSize != null ? fmt2(stats.totalSize * 2) : "0 MB"} sub="this month" color="cyan" />
+        <MetricCard icon={Film} label="Total Videos" value={stats?.total != null ? stats.total.toLocaleString() : "0"} sub="across all folders" color="accent" />
+        <MetricCard icon={HardDrive} label="Storage Used" value={stats?.totalSize != null ? fmt2(stats.totalSize) : "0 MB"} sub="source files" color="crimson" />
+        <MetricCard icon={Zap} label="Bandwidth" value={stats?.totalSize != null ? fmt2(stats.totalSize * 2) : "0 MB"} sub="this month" color="neutral" />
         <MetricCard icon={Eye} label="Total Views" value={stats?.totalViews != null ? (stats.totalViews >= 1000 ? `${(stats.totalViews/1000).toFixed(1)}K` : String(stats.totalViews)) : "0"} sub="all time" color="emerald" />
       </div>
 
@@ -438,9 +416,9 @@ function DashboardPage({ setPage, online }: { setPage: (p: Page) => void; online
               <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" />
               <XAxis dataKey="time" tick={{ fill: "rgba(255,255,255,0.28)", fontSize: 10 }} axisLine={false} tickLine={false} />
               <YAxis tick={{ fill: "rgba(255,255,255,0.28)", fontSize: 10 }} axisLine={false} tickLine={false} unit=" GB" />
-              <Tooltip contentStyle={{ background: "#0f1320", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 12, color: "#fff", fontSize: 11 }} />
-              <Area type="monotone" dataKey="upload" stroke="#2563eb" strokeWidth={2} />
-              <Area type="monotone" dataKey="download" stroke="#4f46e5" strokeWidth={2} />
+              <Tooltip contentStyle={{ background: "#1f1f1f", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 12, color: "#fff", fontSize: 11 }} />
+              <Area type="monotone" dataKey="upload" stroke="#e50914" strokeWidth={2} />
+              <Area type="monotone" dataKey="download" stroke="#d2d2d2" strokeWidth={2} />
             </AreaChart>
           </ResponsiveContainer>
         </GlassCard>
@@ -463,8 +441,8 @@ function DashboardPage({ setPage, online }: { setPage: (p: Page) => void; online
               <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" />
               <XAxis dataKey="day" tick={{ fill: "rgba(255,255,255,0.28)", fontSize: 10 }} axisLine={false} tickLine={false} />
               <YAxis tick={{ fill: "rgba(255,255,255,0.28)", fontSize: 10 }} axisLine={false} tickLine={false} />
-              <Tooltip contentStyle={{ background: "#0f1320", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 12, color: "#fff", fontSize: 11 }} />
-              <Bar dataKey="views" fill="#2563eb" radius={[5, 5, 0, 0]} />
+              <Tooltip contentStyle={{ background: "#1f1f1f", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 12, color: "#fff", fontSize: 11 }} />
+              <Bar dataKey="views" fill="#e50914" radius={[5, 5, 0, 0]} />
             </BarChart>
           </ResponsiveContainer>
         </GlassCard>
@@ -472,7 +450,7 @@ function DashboardPage({ setPage, online }: { setPage: (p: Page) => void; online
         <GlassCard className="p-5">
           <h3 className="text-sm font-semibold text-white/75 mb-4 flex items-center justify-between">
             Encoding Queue
-            <button onClick={() => setPage("encoding")} className="text-[10px] font-mono text-blue-400/70 hover:text-blue-400 transition-colors">View all →</button>
+            <button onClick={() => navigate("/admin/encoding")} className="text-[10px] font-mono text-[var(--sv-text-muted)] hover:text-white transition-colors">View all →</button>
           </h3>
           <div className="space-y-4">
             {(online && encJobs.length > 0
@@ -481,7 +459,7 @@ function DashboardPage({ setPage, online }: { setPage: (p: Page) => void; online
                   name: v.originalName || v.title,
                   stage: v.encodingStage || v.status,
                   pct: v.encodingProgress ?? 0,
-                  color: v.status === "failed" ? "#ef4444" : ["#2563eb","#4f46e5","#06b6d4","#10b981"][i % 4],
+                  color: v.status === "failed" ? "#ef4444" : ["#e50914","#d2d2d2","#f59e0b","#10b981"][i % 4],
                 }))
               : []
             ).map(item => (
@@ -686,20 +664,20 @@ function UploadPage({ online, liveEvents }: { online: boolean | null; liveEvents
         onDragOver={e => { e.preventDefault(); setDragging(true); }}
         onDragLeave={() => setDragging(false)}
         onDrop={e => { e.preventDefault(); setDragging(false); handleFiles(e.dataTransfer.files); }}
-        animate={{ borderColor: dragging ? "#2563eb" : "rgba(255,255,255,0.09)" }}
+        animate={{ borderColor: dragging ? "#e50914" : "rgba(255,255,255,0.09)" }}
         transition={{ duration: 0.18 }}
         className="rounded-2xl border-2 border-dashed p-16 flex flex-col items-center justify-center cursor-pointer relative overflow-hidden"
-        style={{ background: dragging ? "rgba(37,99,235,0.06)" : "rgba(255,255,255,0.018)" }}
+        style={{ background: dragging ? "rgba(229,9,20,0.07)" : "rgba(255,255,255,0.018)" }}
         onClick={() => fileRef.current?.click()}
       >
         {dragging && (
           <motion.div className="absolute inset-0 pointer-events-none" initial={{ opacity: 0 }} animate={{ opacity: 1 }}
-            style={{ background: "radial-gradient(ellipse at center, rgba(37,99,235,0.14) 0%, transparent 70%)" }} />
+            style={{ background: "radial-gradient(ellipse at center, rgba(229,9,20,0.14) 0%, transparent 70%)" }} />
         )}
         <motion.div animate={{ scale: dragging ? 1.08 : 1 }} transition={{ type: "spring", stiffness: 280 }}>
           <div className="w-20 h-20 rounded-2xl flex items-center justify-center mx-auto mb-5 border"
-            style={{ background: "rgba(37,99,235,0.1)", borderColor: "rgba(37,99,235,0.25)" }}>
-            <UploadCloud size={34} className="text-blue-400" />
+            style={{ background: "var(--sv-accent-soft)", borderColor: "var(--sv-accent-border)" }}>
+            <UploadCloud size={34} className="text-[var(--sv-accent)]" />
           </div>
         </motion.div>
         <h2 className="text-xl font-bold text-white mb-2" style={{ fontFamily: "'Outfit', sans-serif" }}>
@@ -708,9 +686,9 @@ function UploadPage({ online, liveEvents }: { online: boolean | null; liveEvents
         <p className="text-sm text-white/35 mb-7">or click to browse — MP4, MOV, MKV, AVI, WebM · Max 100 GB</p>
         <div className="flex items-center gap-6 text-xs font-mono text-white/28">
           {[
-            { icon: Layers, label: "Chunked", color: "#2563eb" },
+            { icon: Layers, label: "Chunked", color: "#e50914" },
             { icon: RefreshCw, label: "Auto-resume", color: "#10b981" },
-            { icon: ShieldCheck, label: "Hash verified", color: "#4f46e5" },
+            { icon: ShieldCheck, label: "Hash verified", color: "#d2d2d2" },
             { icon: Zap, label: "Parallel", color: "#f59e0b" },
           ].map(f => (
             <span key={f.label} className="flex items-center gap-1.5">
@@ -728,7 +706,7 @@ function UploadPage({ online, liveEvents }: { online: boolean | null; liveEvents
           <h3 className="text-sm font-semibold text-white/75">Upload Queue</h3>
           <div className="flex items-center gap-2 text-xs font-mono">
             {uploads.filter(i => i.status === "uploading").length > 0 && (
-              <span className="px-2 py-0.5 rounded-md bg-blue-500/10 text-blue-400 border border-blue-500/15">
+              <span className="px-2 py-0.5 rounded-md bg-[var(--sv-accent-soft)] text-[var(--sv-accent-text)] border border-[var(--sv-accent-border)]">
                 {uploads.filter(i => i.status === "uploading").length} uploading
               </span>
             )}
@@ -743,9 +721,9 @@ function UploadPage({ online, liveEvents }: { online: boolean | null; liveEvents
               <div className="flex items-start gap-4">
                 <div className="flex-shrink-0 mt-0.5">
                   {item.status === "uploading" ? (
-                    <ProgressRing pct={item.progress} size={44} color="#2563eb" label={`${item.progress}%`} />
+                    <ProgressRing pct={item.progress} size={44} color="var(--sv-accent)" label={`${item.progress}%`} />
                   ) : item.status === "encoding" ? (
-                    <ProgressRing pct={80} size={44} color="#4f46e5" label="enc" />
+                    <ProgressRing pct={80} size={44} color="#d2d2d2" label="enc" />
                   ) : item.status === "error" ? (
                     <div className="w-11 h-11 rounded-xl bg-red-500/10 border border-red-500/20 flex items-center justify-center">
                       <AlertCircle size={18} className="text-red-400" />
@@ -768,7 +746,7 @@ function UploadPage({ online, liveEvents }: { online: boolean | null; liveEvents
                     {item.status === "uploading" && (
                       <>
                         <span className="text-white/15">·</span>
-                        <span className="text-blue-400/70">{item.speed} MB/s</span>
+                        <span className="text-[var(--sv-accent-text)]">{item.speed} MB/s</span>
                         <span className="text-white/15">·</span>
                         <span>ETA {fmtEta(item.eta)}</span>
                       </>
@@ -782,14 +760,14 @@ function UploadPage({ online, liveEvents }: { online: boolean | null; liveEvents
                         const filled = ci < Math.floor(item.chunksUploaded / item.chunks * 24);
                         const active = ci === Math.floor(item.chunksUploaded / item.chunks * 24);
                         return (
-                          <div key={ci} className={`h-2 rounded-sm flex-1 min-w-0 transition-all ${filled ? "bg-blue-500" : active ? "bg-blue-400 animate-pulse" : "bg-white/8"}`}
+                          <div key={ci} className={`h-2 rounded-sm flex-1 min-w-0 transition-all ${filled ? "bg-[var(--sv-accent)]" : active ? "bg-[var(--sv-accent-hover)] animate-pulse" : "bg-white/8"}`}
                             style={{ maxWidth: 10 }} />
                         );
                       })}
                     </div>
                   )}
                   <ProgressBar value={item.progress}
-                    color={item.status === "error" ? "#ef4444" : item.status === "done" || item.status === "encoding" ? "#10b981" : item.status === "paused" ? "#f59e0b" : "#2563eb"} />
+                    color={item.status === "error" ? "#ef4444" : item.status === "done" || item.status === "encoding" ? "#10b981" : item.status === "paused" ? "#f59e0b" : "var(--sv-accent)"} />
                 </div>
                 <div className="flex items-center gap-1 flex-shrink-0">
                   {item.status === "uploading" && (
@@ -867,13 +845,13 @@ function UploadPage({ online, liveEvents }: { online: boolean | null; liveEvents
                 <div className={`flex flex-col items-center gap-2 px-3 py-2.5 rounded-xl ${isDone || isActive ? "opacity-100" : "opacity-30"}`}>
                   <div className={`w-9 h-9 rounded-xl flex items-center justify-center border transition-all ${
                     isDone ? "bg-emerald-500/12 border-emerald-500/28" :
-                    isActive ? "bg-blue-500/18 border-blue-500/35" :
+                    isActive ? "bg-[var(--sv-accent-soft)] border-[var(--sv-accent-border)]" :
                     "bg-white/4 border-white/10"}`}>
                     {isDone ? <Check size={15} className="text-emerald-400" /> :
-                     isActive ? <Loader2 size={15} className="text-blue-400 animate-spin" /> :
+                     isActive ? <Loader2 size={15} className="text-[var(--sv-accent)] animate-spin" /> :
                      <Icon size={14} className="text-white/28" />}
                   </div>
-                  <span className={`text-[9.5px] font-mono font-semibold whitespace-nowrap ${isDone ? "text-emerald-400" : isActive ? "text-blue-400" : "text-white/28"}`}>{stage.label}</span>
+                  <span className={`text-[9.5px] font-mono font-semibold whitespace-nowrap ${isDone ? "text-emerald-400" : isActive ? "text-[var(--sv-accent-text)]" : "text-white/28"}`}>{stage.label}</span>
                 </div>
                 {i < pipelineStages.length - 1 && (
                   <div className={`w-3 h-px flex-shrink-0 ${isDone ? "bg-emerald-500/35" : "bg-white/8"}`} />
@@ -891,11 +869,14 @@ function UploadPage({ online, liveEvents }: { online: boolean | null; liveEvents
 
 // ─── Video Library ────────────────────────────────────────────────────────────
 function LibraryPage({ onPlayVideo, online, user }: { onPlayVideo: (v: Video) => void; online: boolean | null; user: AuthUser | null }) {
+  const navigate = useNavigate();
+  const isAdmin = user?.role === "admin";
   const [view, setView] = useState<"grid" | "list">("grid");
   const [filter, setFilter] = useState("all");
   const [search, setSearch] = useState("");
   const [apiVideos, setApiVideos] = useState<Video[]>([]);
   const [loading, setLoading] = useState(false);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
   useEffect(() => {
     if (!online) { setApiVideos([]); return; }
@@ -904,7 +885,8 @@ function LibraryPage({ onPlayVideo, online, user }: { onPlayVideo: (v: Video) =>
       videosApi.list({ status: filter === "all" ? undefined : filter, search: search || undefined })
         .then(data => {
           setApiVideos(data.videos.map(v => ({
-            id: v._id, title: v.title,
+            id: v._id, title: v.title, description: v.description ?? "",
+            ownerId: v.owner?._id ?? "",
             duration: v.duration ? `${Math.floor(v.duration/60)}:${String(v.duration%60).padStart(2,"0")}` : "—",
             size: v.sizeBytes >= 1e9 ? `${(v.sizeBytes/1e9).toFixed(1)} GB` : `${(v.sizeBytes/1e6).toFixed(0)} MB`,
             status: (v.status === "encoding" || v.status === "uploading" ? "processing" : v.status) as Video["status"],
@@ -920,41 +902,65 @@ function LibraryPage({ onPlayVideo, online, user }: { onPlayVideo: (v: Video) =>
     );
   }, [online, filter, search]);
 
+  // Status chips are an admin editorial tool. The API only ever hands a regular
+  // user published videos, so for them every option but "all" would be a control
+  // that silently returns nothing — the row isn't rendered at all below.
   const filters = ["all", "published", "draft", "processing", "failed"];
   const filtered = apiVideos.filter(v =>
     (filter === "all" || v.status === filter) &&
     (!search || v.title.toLowerCase().includes(search.toLowerCase()))
   );
 
+  // One-click delete straight from the library, instead of opening the
+  // player, opening its Details drawer, and hunting for the action there.
+  const handleDeleteVideo = async (id: string, title: string) => {
+    if (!window.confirm(`Delete "${title}"? This cannot be undone.`)) return;
+    setDeletingId(id);
+    try {
+      const { videosApi } = await import("../lib/api");
+      await videosApi.delete(id);
+      setApiVideos(prev => prev.filter(v => v.id !== id));
+    } catch (e: any) {
+      alert(e?.message || "Delete failed.");
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
   return (
     <div className="space-y-5">
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-bold text-white" style={{ fontFamily: "'Outfit', sans-serif" }}>Video Library</h1>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="min-w-0">
+          <h1 className="text-xl sm:text-2xl font-bold text-white" style={{ fontFamily: "'Outfit', sans-serif" }}>Video Library</h1>
           <p className="text-sm text-white/35 mt-0.5">
             {loading ? "Loading…" : `${filtered.length} video${filtered.length !== 1 ? "s" : ""}`}
           </p>
         </div>
-        <button className="flex items-center gap-2 px-4 py-2 rounded-xl text-white text-sm font-semibold hover:opacity-90 transition-all"
-          style={{ background: "linear-gradient(135deg, #2563eb, #4f46e5)" }}>
-          <Plus size={14} />Upload Video
-        </button>
+        {isAdmin && (
+          <button onClick={() => navigate("/admin/upload")}
+            className="flex flex-shrink-0 items-center gap-2 px-4 min-h-[40px] rounded-xl text-white text-sm font-semibold hover:opacity-90 transition-all"
+            style={{ background: "var(--sv-accent)" }}>
+            <Plus size={14} />Upload Video
+          </button>
+        )}
       </div>
 
       <div className="flex items-center gap-3 flex-wrap">
-        <div className="relative flex-1 min-w-48">
+        <div className="relative flex-1 min-w-0 basis-full sm:basis-auto sm:min-w-48">
           <Search size={13} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-white/28" />
           <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search videos…"
-            className="w-full pl-9 pr-4 py-2.5 rounded-xl bg-white/5 border border-white/10 text-sm text-white placeholder-white/22 focus:outline-none focus:border-blue-500/45 transition-colors" />
+            className="w-full pl-9 pr-4 py-2.5 rounded-xl bg-white/5 border border-white/10 text-sm text-white placeholder-white/22 focus:outline-none focus:border-[var(--sv-accent-border)] transition-colors" />
         </div>
-        <div className="flex items-center gap-1 p-1 rounded-xl bg-white/5 border border-white/8 flex-wrap">
-          {filters.map(f => (
-            <button key={f} onClick={() => setFilter(f)}
-              className={`px-3 py-1 rounded-lg text-xs font-medium capitalize transition-all ${filter === f ? "bg-blue-600 text-white" : "text-white/38 hover:text-white/65"}`}>
-              {f}
-            </button>
-          ))}
-        </div>
+        {isAdmin && (
+          <div className="flex items-center gap-1 p-1 rounded-xl bg-white/5 border border-white/8 flex-wrap">
+            {filters.map(f => (
+              <button key={f} onClick={() => setFilter(f)}
+                className={`px-3 py-1 rounded-lg text-xs font-medium capitalize transition-all ${filter === f ? "bg-[var(--sv-accent)] text-white" : "text-white/38 hover:text-white/65"}`}>
+                {f}
+              </button>
+            ))}
+          </div>
+        )}
         <div className="flex items-center gap-1 p-1 rounded-xl bg-white/5 border border-white/8">
           <button onClick={() => setView("grid")} className={`p-2 rounded-lg transition-all ${view === "grid" ? "bg-white/10 text-white" : "text-white/28 hover:text-white/55"}`}><Grid3X3 size={13} /></button>
           <button onClick={() => setView("list")} className={`p-2 rounded-lg transition-all ${view === "list" ? "bg-white/10 text-white" : "text-white/28 hover:text-white/55"}`}><List size={13} /></button>
@@ -963,73 +969,76 @@ function LibraryPage({ onPlayVideo, online, user }: { onPlayVideo: (v: Video) =>
 
       <AnimatePresence mode="wait">
         {view === "grid" ? (
+          /* Netflix-style poster grid — same data + filters as before, just
+             rendered through the shared PosterCard primitive. */
           <motion.div key="grid" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.15 }}
-            className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-            {filtered.map((v, idx) => (
-              <motion.div key={v.id} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: idx * 0.04 }}
-                className="group rounded-2xl border border-white/[0.06] overflow-hidden hover:border-white/[0.12] transition-all cursor-pointer"
-                style={{ background: "rgba(255,255,255,0.022)" }}
-                onClick={() => onPlayVideo(v)}>
-                <div className="relative aspect-video bg-zinc-900">
-                  <img src={v.thumb} alt={v.title} className="w-full h-full object-cover" />
-                  <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
-                    <div className="w-11 h-11 rounded-full bg-white/20 backdrop-blur-sm flex items-center justify-center border border-white/30">
-                      <Play size={16} className="text-white ml-0.5" fill="white" />
-                    </div>
-                  </div>
-                  <div className="absolute bottom-2 right-2 px-1.5 py-0.5 rounded bg-black/70 backdrop-blur-sm text-xs font-mono text-white">{v.duration}</div>
-                  <div className="absolute top-2 left-2"><StatusBadge status={v.status} /></div>
-                </div>
-                <div className="p-4">
-                  <h4 className="text-sm font-semibold text-white mb-2 line-clamp-2 leading-snug">{v.title}</h4>
-                  <div className="flex items-center gap-2.5 text-xs font-mono text-white/32">
-                    <span>{v.resolution}</span><span className="text-white/15">·</span>
-                    <span>{v.size}</span><span className="text-white/15">·</span>
-                    <span className="flex items-center gap-1"><Eye size={10} />{(v.views ?? 0).toLocaleString()}</span>
-                  </div>
-                  <div className="flex gap-1.5 mt-3 flex-wrap">
-                    {v.tags.map(t => <span key={t} className="px-2 py-0.5 rounded-md bg-white/5 border border-white/8 text-[10px] text-white/35 font-mono">{t}</span>)}
-                  </div>
-                </div>
-              </motion.div>
+            className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-3 sm:gap-4">
+            {filtered.map(v => (
+              <PosterCard
+                key={v.id}
+                to={`/watch/${v.id}`}
+                title={v.title}
+                {...(v.thumb ? { imageUrl: v.thumb } : {})}
+                subtitle={[...(isAdmin ? [v.resolution, v.size] : []), `${(v.views ?? 0).toLocaleString()} views`].filter(x => x && x !== "—").join(" · ")}
+                badge={v.status === "published" ? v.duration : v.status}
+                dimmed={v.status !== "published"}
+                {...(isAdmin ? { onDelete: () => handleDeleteVideo(v.id, v.title), deleting: deletingId === v.id } : {})}
+              />
             ))}
+            {filtered.length === 0 && !loading && (
+              <p className="col-span-full py-16 text-center text-sm text-white/35">No videos match this filter.</p>
+            )}
           </motion.div>
         ) : (
           <motion.div key="list" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.15 }}>
             <GlassCard className="p-0 overflow-hidden">
-              <table className="w-full">
+              {/* Scroll the table itself rather than the page on narrow screens */}
+              <div className="overflow-x-auto">
+              <table className="w-full min-w-[420px]">
                 <thead>
                   <tr className="border-b border-white/[0.05]">
-                    {["Title", "Status", "Resolution", "Size", "Views", ""].map((h, i) => (
-                      <th key={i} className={`text-left text-xs font-semibold text-white/32 px-5 py-3 ${i > 1 && i < 4 ? "hidden md:table-cell" : ""} ${i === 1 ? "hidden lg:table-cell" : ""}`}>{h}</th>
+                    {["Title", "Status", ...(isAdmin ? ["Resolution", "Size"] : []), "Views", ""].map((h, i) => (
+                      <th key={i} className={`text-left text-xs font-semibold text-white/32 px-3 sm:px-5 py-3 ${isAdmin && i > 1 && i < 4 ? "hidden md:table-cell" : ""} ${i === 1 ? "hidden lg:table-cell" : ""}`}>{h}</th>
                     ))}
                   </tr>
                 </thead>
                 <tbody>
                   {filtered.map(v => (
                     <tr key={v.id} className="border-b border-white/[0.04] last:border-0 hover:bg-white/[0.025] transition-colors cursor-pointer" onClick={() => onPlayVideo(v)}>
-                      <td className="px-5 py-3">
+                      <td className="px-3 sm:px-5 py-3">
                         <div className="flex items-center gap-3">
                           <img src={v.thumb} alt={v.title} className="w-12 h-7 rounded-lg object-cover bg-zinc-800 flex-shrink-0" />
-                          <div>
+                          <div className="min-w-0">
                             <p className="text-sm text-white font-medium line-clamp-1">{v.title}</p>
-                            <p className="text-xs font-mono text-white/28 mt-0.5">{v.duration} · {v.uploadedAt}</p>
+                            <p className="text-xs font-mono text-white/28 mt-0.5 truncate">{v.duration} · {v.uploadedAt}</p>
                           </div>
                         </div>
                       </td>
                       <td className="px-3 py-3 hidden lg:table-cell"><StatusBadge status={v.status} /></td>
-                      <td className="px-3 py-3 hidden md:table-cell text-xs font-mono text-white/42">{v.resolution}</td>
-                      <td className="px-3 py-3 hidden md:table-cell text-xs font-mono text-white/42">{v.size}</td>
+                      {isAdmin && <td className="px-3 py-3 hidden md:table-cell text-xs font-mono text-white/42">{v.resolution}</td>}
+                      {isAdmin && <td className="px-3 py-3 hidden md:table-cell text-xs font-mono text-white/42">{v.size}</td>}
                       <td className="px-3 py-3 text-xs font-mono text-white/42">{(v.views ?? 0).toLocaleString()}</td>
                       <td className="px-3 py-3">
-                        <button onClick={e => e.stopPropagation()} className="p-1.5 rounded-lg hover:bg-white/8 text-white/25 hover:text-white/60 transition-colors">
-                          <MoreVertical size={13} />
-                        </button>
+                        {isAdmin ? (
+                          <button
+                            onClick={e => { e.stopPropagation(); handleDeleteVideo(v.id, v.title); }}
+                            disabled={deletingId === v.id}
+                            title="Delete video"
+                            aria-label="Delete video"
+                            className="p-1.5 rounded-lg hover:bg-red-600/20 text-white/25 hover:text-red-400 transition-colors disabled:opacity-50">
+                            {deletingId === v.id ? <Loader2 size={13} className="animate-spin" /> : <Trash2 size={13} />}
+                          </button>
+                        ) : (
+                          <button onClick={e => e.stopPropagation()} className="p-1.5 rounded-lg hover:bg-white/8 text-white/25 hover:text-white/60 transition-colors">
+                            <MoreVertical size={13} />
+                          </button>
+                        )}
                       </td>
                     </tr>
                   ))}
                 </tbody>
               </table>
+              </div>
             </GlassCard>
           </motion.div>
         )}
@@ -1038,369 +1047,107 @@ function LibraryPage({ onPlayVideo, online, user }: { onPlayVideo: (v: Video) =>
   );
 }
 
-// ─── Netflix-style HLS Video Player ───────────────────────────────────────────
-interface HlsPlayerProps {
-  src: string;
-  poster?: string;
-  onError?: (msg: string) => void;
-}
-
-function HlsPlayer({ src, poster, onError }: HlsPlayerProps) {
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const containerRef = useRef<HTMLDivElement>(null);
-  const hlsRef = useRef<Hls | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [muted, setMuted] = useState(false);
-  const [volume, setVolume] = useState(1);
-  const [currentTime, setCurrentTime] = useState(0);
-  const [duration, setDuration] = useState(0);
-  const [buffered, setBuffered] = useState(0);
-  const [loading, setLoading] = useState(true);
-  const [showControls, setShowControls] = useState(true);
-  const [playbackRate, setPlaybackRate] = useState(1);
-  const [levels, setLevels] = useState<Array<{ height: number; bitrate: number; index: number }>>([]);
-  const [currentLevel, setCurrentLevel] = useState(-1); // -1 = auto
-  const [showSettings, setShowSettings] = useState(false);
-  const [isFullscreen, setIsFullscreen] = useState(false);
-  const controlsTimerRef = useRef<number | null>(null);
-
-  const scheduleHideControls = useCallback(() => {
-    if (controlsTimerRef.current) window.clearTimeout(controlsTimerRef.current);
-    controlsTimerRef.current = window.setTimeout(() => setShowControls(false), 3000);
-  }, []);
-
-  const showControlsNow = useCallback(() => {
-    setShowControls(true);
-    scheduleHideControls();
-  }, [scheduleHideControls]);
-
-  useEffect(() => {
-    const video = videoRef.current;
-    if (!video || !src) return;
-    setError(null);
-    setLoading(true);
-
-    if (Hls.isSupported()) {
-      const hls = new Hls({
-        startLevel: -1,
-        capLevelToPlayerSize: true,
-        maxBufferLength: 30,
-        maxMaxBufferLength: 60,
-        maxBufferSize: 60 * 1000 * 1000,
-        lowLatencyMode: false,
-      });
-      hlsRef.current = hls;
-      hls.loadSource(src);
-      hls.attachMedia(video);
-
-      hls.on(Hls.Events.MANIFEST_PARSED, (_e, data) => {
-        setLoading(false);
-        const lvls = (data.levels || []).map((l: any, i: number) => ({
-          height: l.height || 0,
-          bitrate: l.bitrate || 0,
-          index: i,
-        }));
-        setLevels(lvls);
-      });
-      hls.on(Hls.Events.ERROR, (_evt, data) => {
-        if (data.fatal) {
-          switch (data.type) {
-            case Hls.ErrorTypes.NETWORK_ERROR:
-              hls.startLoad();
-              break;
-            case Hls.ErrorTypes.MEDIA_ERROR:
-              hls.recoverMediaError();
-              break;
-            default:
-              const msg = data.details || "Playback error";
-              setError(msg);
-              onError?.(msg);
-              hls.destroy();
-          }
-        }
-      });
-
-      return () => { hls.destroy(); hlsRef.current = null; };
-    } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
-      video.src = src;
-      video.addEventListener("loadedmetadata", () => setLoading(false));
-    } else {
-      const msg = "HLS is not supported in this browser";
-      setError(msg);
-      onError?.(msg);
-    }
-  }, [src, onError]);
-
-  useEffect(() => {
-    const v = videoRef.current;
-    if (!v) return;
-    const onTime = () => {
-      setCurrentTime(v.currentTime);
-      if (v.buffered.length > 0) setBuffered(v.buffered.end(v.buffered.length - 1));
-    };
-    const onDur = () => setDuration(v.duration || 0);
-    const onPlay = () => setIsPlaying(true);
-    const onPause = () => setIsPlaying(false);
-    const onWaiting = () => setLoading(true);
-    const onPlaying = () => setLoading(false);
-    const onVol = () => { setMuted(v.muted); setVolume(v.volume); };
-    v.addEventListener("timeupdate", onTime);
-    v.addEventListener("durationchange", onDur);
-    v.addEventListener("play", onPlay);
-    v.addEventListener("pause", onPause);
-    v.addEventListener("waiting", onWaiting);
-    v.addEventListener("playing", onPlaying);
-    v.addEventListener("volumechange", onVol);
-    return () => {
-      v.removeEventListener("timeupdate", onTime);
-      v.removeEventListener("durationchange", onDur);
-      v.removeEventListener("play", onPlay);
-      v.removeEventListener("pause", onPause);
-      v.removeEventListener("waiting", onWaiting);
-      v.removeEventListener("playing", onPlaying);
-      v.removeEventListener("volumechange", onVol);
-    };
-  }, []);
-
-  useEffect(() => {
-    const onFs = () => setIsFullscreen(!!document.fullscreenElement);
-    document.addEventListener("fullscreenchange", onFs);
-    return () => document.removeEventListener("fullscreenchange", onFs);
-  }, []);
-
-  const togglePlay = () => {
-    const v = videoRef.current;
-    if (!v) return;
-    v.paused ? v.play() : v.pause();
-  };
-  const toggleMute = () => { const v = videoRef.current; if (v) v.muted = !v.muted; };
-  const setVol = (val: number) => { const v = videoRef.current; if (v) { v.volume = val; v.muted = val === 0; } };
-  const seek = (t: number) => { const v = videoRef.current; if (v) v.currentTime = Math.max(0, Math.min(duration, t)); };
-  const setRate = (r: number) => { const v = videoRef.current; if (v) { v.playbackRate = r; setPlaybackRate(r); } };
-  const changeQuality = (i: number) => {
-    const hls = hlsRef.current;
-    if (!hls) return;
-    hls.currentLevel = i; // -1 = auto
-    setCurrentLevel(i);
-    setShowSettings(false);
-  };
-  const toggleFullscreen = () => {
-    const c = containerRef.current;
-    if (!c) return;
-    if (!document.fullscreenElement) c.requestFullscreen();
-    else document.exitFullscreen();
-  };
-
-  const fmtTime = (t: number) => {
-    if (!isFinite(t) || t < 0) return "0:00";
-    const h = Math.floor(t / 3600);
-    const m = Math.floor((t % 3600) / 60);
-    const s = Math.floor(t % 60);
-    return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}` : `${m}:${String(s).padStart(2, "0")}`;
-  };
-
-  if (error) {
-    return (
-      <div className="w-full h-full flex items-center justify-center bg-black text-white/60 text-sm">
-        <div className="text-center">
-          <AlertCircle className="mx-auto mb-2 text-red-400" size={28} />
-          <p>{error}</p>
-        </div>
-      </div>
-    );
-  }
-
-  const progressPct = duration > 0 ? (currentTime / duration) * 100 : 0;
-  const bufferedPct = duration > 0 ? (buffered / duration) * 100 : 0;
-
-  return (
-    <div
-      ref={containerRef}
-      className="relative w-full h-full bg-black group"
-      onMouseMove={showControlsNow}
-      onMouseLeave={() => setShowControls(false)}
-    >
-      <video
-        ref={videoRef}
-        poster={poster}
-        className="w-full h-full object-contain bg-black"
-        onClick={togglePlay}
-        onDoubleClick={toggleFullscreen}
-        style={{ display: "block" }}
-      />
-
-      {loading && (
-        <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-          <Loader2 size={44} className="text-white/80 animate-spin" />
-        </div>
-      )}
-
-      {/* Center play/pause overlay */}
-      {!isPlaying && !loading && (
-        <button
-          onClick={togglePlay}
-          className="absolute inset-0 flex items-center justify-center bg-black/20 hover:bg-black/30 transition-colors"
-        >
-          <div className="w-20 h-20 rounded-full bg-white/15 backdrop-blur-md border border-white/25 flex items-center justify-center">
-            <Play size={30} className="text-white ml-1" fill="white" />
-          </div>
-        </button>
-      )}
-
-      {/* Controls bar */}
-      <div
-        className={`absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/95 via-black/60 to-transparent px-4 pt-14 pb-3 transition-opacity duration-300 ${showControls || !isPlaying ? "opacity-100" : "opacity-0 pointer-events-none"}`}
-      >
-        {/* Progress bar */}
-        <div className="relative w-full h-1 group/progress cursor-pointer mb-2 hover:h-1.5 transition-all"
-          onClick={e => {
-            const rect = e.currentTarget.getBoundingClientRect();
-            seek(((e.clientX - rect.left) / rect.width) * duration);
-          }}>
-          <div className="absolute inset-0 bg-white/20 rounded-full" />
-          <div className="absolute inset-y-0 left-0 bg-white/40 rounded-full" style={{ width: `${bufferedPct}%` }} />
-          <div className="absolute inset-y-0 left-0 bg-red-500 rounded-full" style={{ width: `${progressPct}%` }} />
-          <div
-            className="absolute top-1/2 -translate-y-1/2 -translate-x-1/2 w-3 h-3 rounded-full bg-red-500 opacity-0 group-hover/progress:opacity-100 transition-opacity"
-            style={{ left: `${progressPct}%` }}
-          />
-        </div>
-
-        {/* Buttons row */}
-        <div className="flex items-center gap-3 text-white">
-          <button onClick={togglePlay} className="hover:text-red-400 transition-colors">
-            {isPlaying ? <Pause size={20} fill="white" /> : <Play size={20} fill="white" />}
-          </button>
-          <button onClick={() => seek(currentTime - 10)} className="hover:text-red-400 transition-colors" title="Back 10s">
-            <SkipForward size={18} className="rotate-180" />
-          </button>
-          <button onClick={() => seek(currentTime + 10)} className="hover:text-red-400 transition-colors" title="Forward 10s">
-            <SkipForward size={18} />
-          </button>
-
-          {/* Volume */}
-          <div className="flex items-center gap-1 group/vol">
-            <button onClick={toggleMute} className="hover:text-red-400 transition-colors">
-              <Volume2 size={18} className={muted || volume === 0 ? "opacity-40" : ""} />
-            </button>
-            <input
-              type="range" min={0} max={1} step={0.05}
-              value={muted ? 0 : volume}
-              onChange={e => setVol(parseFloat(e.target.value))}
-              className="w-0 group-hover/vol:w-20 transition-all accent-red-500"
-            />
-          </div>
-
-          <span className="text-xs font-mono text-white/85 ml-1">
-            {fmtTime(currentTime)} / {fmtTime(duration)}
-          </span>
-
-          <div className="ml-auto flex items-center gap-3 relative">
-            {/* Settings gear */}
-            <button onClick={() => setShowSettings(s => !s)} className="hover:text-red-400 transition-colors">
-              <Settings size={18} />
-            </button>
-
-            {showSettings && (
-              <div className="absolute bottom-full right-0 mb-3 w-56 rounded-xl bg-black/95 border border-white/10 backdrop-blur-xl overflow-hidden shadow-2xl">
-                <div className="px-4 py-2.5 border-b border-white/10">
-                  <p className="text-[10px] font-mono text-white/40 uppercase tracking-wider mb-2">Quality</p>
-                  <div className="space-y-0.5">
-                    <button
-                      onClick={() => changeQuality(-1)}
-                      className={`w-full text-left px-2 py-1.5 rounded-md text-xs flex items-center justify-between hover:bg-white/10 ${currentLevel === -1 ? "text-red-400" : "text-white/80"}`}
-                    >
-                      <span>Auto</span>
-                      {currentLevel === -1 && <Check size={12} />}
-                    </button>
-                    {levels.map(l => (
-                      <button
-                        key={l.index}
-                        onClick={() => changeQuality(l.index)}
-                        className={`w-full text-left px-2 py-1.5 rounded-md text-xs flex items-center justify-between hover:bg-white/10 ${currentLevel === l.index ? "text-red-400" : "text-white/80"}`}
-                      >
-                        <span>{l.height ? `${l.height}p` : `Level ${l.index}`}</span>
-                        <span className="font-mono text-[10px] text-white/40">{Math.round(l.bitrate / 1000)}k</span>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-                <div className="px-4 py-2.5">
-                  <p className="text-[10px] font-mono text-white/40 uppercase tracking-wider mb-2">Speed</p>
-                  <div className="grid grid-cols-4 gap-1">
-                    {[0.5, 0.75, 1, 1.25, 1.5, 1.75, 2].map(r => (
-                      <button
-                        key={r}
-                        onClick={() => setRate(r)}
-                        className={`px-2 py-1 rounded-md text-[11px] font-mono hover:bg-white/10 ${playbackRate === r ? "text-red-400 bg-white/5" : "text-white/70"}`}
-                      >
-                        {r === 1 ? "1x" : `${r}x`}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              </div>
-            )}
-
-            <button onClick={toggleFullscreen} className="hover:text-red-400 transition-colors" title="Fullscreen">
-              <Maximize2 size={18} />
-            </button>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
 // ─── Video Player ─────────────────────────────────────────────────────────────
-function PlayerPage({ video, onBack }: { video: Video | null; onBack: () => void }) {
+function PlayerPage({ user }: { user: AuthUser | null } = { user: null }) {
+  const isAdmin = user?.role === "admin";
+  // Video identity now comes from the URL (`/watch/:videoId`) instead of a prop,
+  // so deep links and page refreshes resolve the right video.
+  const { videoId } = useParams<{ videoId: string }>();
+  const navigate = useNavigate();
+  const onBack = useCallback(() => navigate(-1), [navigate]);
+
   const [activeTab, setActiveTab] = useState("details");
   const [showThumbnailSelector, setShowThumbnailSelector] = useState(false);
   const [thumbnailOptions, setThumbnailOptions] = useState<ThumbnailOption[]>([]);
   const [loadingThumbnails, setLoadingThumbnails] = useState(false);
-  const [currentVideo, setCurrentVideo] = useState<Video | null>(video);
+  const [currentVideo, setCurrentVideo] = useState<Video | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [actionMsg, setActionMsg] = useState<{ text: string; ok: boolean } | null>(null);
   const [downloadUrl, setDownloadUrl] = useState<string>("");
   const [confirmDelete, setConfirmDelete] = useState(false);
+
+  // Cinematic chrome: the back button / title overlay and the details drawer
+  // toggle. The overlay fades on the same 3s cadence HlsPlayer uses internally
+  // for its own transport controls, so everything disappears together.
+  const [showChrome, setShowChrome] = useState(true);
+  const [showDetails, setShowDetails] = useState(false);
+  const chromeTimer = useRef<number | null>(null);
+  const bumpChrome = useCallback(() => {
+    setShowChrome(true);
+    if (chromeTimer.current) window.clearTimeout(chromeTimer.current);
+    chromeTimer.current = window.setTimeout(() => setShowChrome(false), 3000);
+  }, []);
+  useEffect(() => {
+    bumpChrome();
+    return () => { if (chromeTimer.current) window.clearTimeout(chromeTimer.current); };
+  }, [bumpChrome]);
 
   const showMsg = (text: string, ok: boolean) => {
     setActionMsg({ text, ok });
     setTimeout(() => setActionMsg(null), 3000);
   };
 
-  // Refresh video from backend once (and again on retry) when HLS is not ready yet
+  // Load the video from the backend, then keep polling while HLS is not ready yet
   useEffect(() => {
-    if (!currentVideo?.id) return;
+    if (!videoId) return;
+    // Navigating straight from one /watch/:id to another must not render stale data
+    setCurrentVideo(prev => (prev && prev.id !== videoId ? null : prev));
     let stopped = false;
     const tick = async () => {
       try {
         const { videosApi } = await import("../lib/api");
-        const v = await videosApi.get(currentVideo.id);
+        const v = await videosApi.get(videoId);
         if (stopped) return;
+        setLoadError(null);
         setDownloadUrl(v.downloadUrl || "");
-        if (v.hlsUrl && !currentVideo.hlsUrl) {
-          setCurrentVideo(prev => prev ? {
-            ...prev,
-            hlsUrl: v.hlsUrl,
-            thumb: v.thumbnailUrl || prev.thumb,
-            status: (v.status === "encoding" || v.status === "uploading" ? "processing" : v.status) as Video["status"],
-            resolution: v.height ? `${v.height}p` : prev.resolution,
-            codec: v.codec || prev.codec,
-            streams: v.streams,
-          } : prev);
-        }
-      } catch { /* ignore */ }
+        setCurrentVideo(prev => ({
+          id: v._id,
+          title: v.title,
+          description: v.description ?? "",
+          ownerId: v.owner?._id ?? "",
+          duration: v.duration ? `${Math.floor(v.duration / 60)}:${String(v.duration % 60).padStart(2, "0")}` : "—",
+          size: v.sizeBytes >= 1e9 ? `${(v.sizeBytes / 1e9).toFixed(1)} GB` : `${(v.sizeBytes / 1e6).toFixed(0)} MB`,
+          status: (v.status === "encoding" || v.status === "uploading" ? "processing" : v.status) as Video["status"],
+          views: v.views,
+          thumb: v.thumbnailUrl || (v.thumbnailPath ? `/uploads/${v.thumbnailPath}` : "") || prev?.thumb || "",
+          hlsUrl: v.hlsUrl || undefined,
+          resolution: v.height ? `${v.height}p` : "—",
+          codec: v.codec || "—",
+          uploadedAt: v.createdAt ? v.createdAt.slice(0, 10) : "—",
+          tags: v.tags ?? [],
+          streams: v.streams,
+        }));
+      } catch (e: any) {
+        if (!stopped) setLoadError(e?.message || "Could not load this video.");
+      }
     };
     tick();
-    if (!currentVideo.hlsUrl) {
+    if (!currentVideo?.hlsUrl) {
       const iv = setInterval(tick, 4000);
       return () => { stopped = true; clearInterval(iv); };
     }
     return () => { stopped = true; };
-  }, [currentVideo?.id, currentVideo?.hlsUrl]);
+  }, [videoId, currentVideo?.hlsUrl]);
 
-  const v = currentVideo!;
+  if (!currentVideo) {
+    return (
+      <div className="fixed inset-0 z-50 flex flex-col items-center justify-center gap-4 bg-black">
+        {loadError ? (
+          <>
+            <AlertCircle size={26} className="text-red-400" />
+            <p className="text-sm text-white/50">{loadError}</p>
+            <button onClick={onBack} className="px-4 py-2 rounded-lg bg-white/5 border border-white/10 text-xs text-white/60 hover:bg-white/8 hover:text-white transition-colors">
+              Go back
+            </button>
+          </>
+        ) : (
+          <Loader2 size={26} className="animate-spin text-[var(--sv-accent)]" />
+        )}
+      </div>
+    );
+  }
+
+  const v = currentVideo;
   const hasHls = !!v.hlsUrl;
 
   const handleGenerateThumbnails = async () => {
@@ -1447,7 +1194,7 @@ function PlayerPage({ video, onBack }: { video: Video | null; onBack: () => void
   };
 
   const handleShare = async () => {
-    const url = `${window.location.origin}/#/player/${v.id}`;
+    const url = `${window.location.origin}/watch/${v.id}`;
     try {
       await navigator.clipboard.writeText(url);
       showMsg("Share link copied", true);
@@ -1511,88 +1258,110 @@ function PlayerPage({ video, onBack }: { video: Video | null; onBack: () => void
   ];
 
   return (
-    <div className="space-y-5">
-      <div className="flex items-center gap-3">
-        <button onClick={onBack} className="p-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/8 transition-colors text-white/50 hover:text-white">
-          <ChevronRight size={16} className="rotate-180" />
-        </button>
-        <div className="flex-1">
-          <h1 className="text-xl font-bold text-white" style={{ fontFamily: "'Outfit', sans-serif" }}>{v.title}</h1>
-          <p className="text-xs text-white/35 font-mono mt-0.5">{v.resolution} · {v.codec} · {v.size}</p>
-        </div>
-        <div className="flex items-center gap-2">
-          <button onClick={handleGenerateThumbnails} disabled={loadingThumbnails}
-            className="px-3 py-1.5 rounded-lg bg-white/5 border border-white/10 text-xs text-white/60 hover:bg-white/8 hover:text-white transition-colors disabled:opacity-50 flex items-center gap-1.5">
-            <Film size={12} />Change Thumbnail
+    <div className="fixed inset-0 z-50 bg-black" onMouseMove={bumpChrome} onTouchStart={bumpChrome}>
+      {/* Full-bleed playback surface */}
+      <div className="absolute inset-0">
+        {hasHls ? (
+          <>
+            <HlsPlayer src={v.hlsUrl!} poster={v.thumb} />
+            <div className={`absolute top-4 right-4 flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-black/65 backdrop-blur-sm border border-white/10 text-xs font-mono text-emerald-400 pointer-events-none transition-opacity duration-300 ${showChrome ? "opacity-100" : "opacity-0"}`}>
+              <Radio size={10} />HLS · Adaptive
+            </div>
+          </>
+        ) : (
+          /* Fallback when HLS isn't ready yet */
+          <div className="relative w-full h-full">
+            {v.thumb && <img src={v.thumb} alt={v.title} className="w-full h-full object-cover opacity-45" />}
+            <div className="absolute inset-0 bg-gradient-to-t from-black via-black/60 to-black/30" />
+            <div className="absolute inset-0 flex items-center justify-center">
+              <div className="text-center space-y-3 px-6">
+                <div className="w-16 h-16 rounded-full flex items-center justify-center border border-white/25 bg-white/10 backdrop-blur-md mx-auto">
+                  {v.status === "processing" || v.status === "encoding" as any
+                    ? <Loader2 size={22} className="text-white/60 animate-spin" />
+                    : <AlertCircle size={22} className="text-amber-400" />}
+                </div>
+                <p className="text-xs text-white/50 font-mono max-w-xs mx-auto">
+                  {v.status === "processing" || v.status === "encoding" as any
+                    ? "Encoding in progress. Video will start streaming automatically when ready."
+                    : v.status === "failed"
+                      ? "Encoding failed. Click Re-encode below to try again."
+                      : "HLS stream is being prepared…"}
+                </p>
+                {v.status === "failed" && (
+                  <button
+                    onClick={handleReEncode}
+                    className="px-4 py-2 rounded-lg bg-[var(--sv-accent)] hover:bg-[var(--sv-accent-hover)] text-white text-xs font-semibold transition-colors inline-flex items-center gap-2"
+                  >
+                    <RefreshCw size={12} />Retry encoding
+                  </button>
+                )}
+              </div>
+            </div>
+            <div className="absolute top-4 right-4 flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-black/65 backdrop-blur-sm border border-white/10 text-xs font-mono text-amber-400">
+              <Radio size={10} />{v.status === "failed" ? "Failed" : "Pending"}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Auto-hiding top scrim: back button, title/metadata, secondary actions */}
+      <div className={`pointer-events-none absolute inset-x-0 top-0 bg-gradient-to-b from-black/90 via-black/45 to-transparent px-4 pb-16 pt-4 sm:px-6 transition-opacity duration-300 ${showChrome || showDetails || !hasHls ? "opacity-100" : "opacity-0"}`}>
+        <div className="pointer-events-auto flex items-start gap-2 sm:gap-3">
+          <button onClick={onBack} aria-label="Back"
+            className="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-full border border-white/15 bg-black/50 text-white/80 backdrop-blur-sm transition-colors hover:bg-black/70 hover:text-white">
+            <ArrowLeft size={17} />
           </button>
+          <div className="min-w-0 flex-1">
+            <h1 className="truncate text-base font-bold text-white sm:text-xl" style={{ fontFamily: "'Outfit', sans-serif" }}>{v.title}</h1>
+            {/* Resolution/codec/size are operational details -- a regular
+                viewer only ever sees a view count, same as everywhere else. */}
+            <p className="mt-0.5 truncate text-[11px] text-white/40 font-mono">
+              {isAdmin ? `${v.resolution} · ${v.codec} · ${v.size} · ` : ""}{(v.views ?? 0).toLocaleString()} views
+            </p>
+          </div>
+          {/* Thumbnail management and the technical details drawer (encoding
+              log, stream ladder, etc.) are admin/ops tools, not viewer-facing. */}
+          {isAdmin && (
+            <div className="flex flex-shrink-0 items-center gap-2">
+              <button onClick={handleGenerateThumbnails} disabled={loadingThumbnails}
+                className="hidden sm:flex px-3 min-h-[40px] rounded-lg bg-black/50 border border-white/12 text-xs text-white/70 hover:bg-black/70 hover:text-white transition-colors disabled:opacity-50 items-center gap-1.5 backdrop-blur-sm">
+                <Film size={12} />Change Thumbnail
+              </button>
+              <button onClick={() => setShowDetails(d => !d)}
+                className="px-3 min-h-[40px] rounded-lg bg-black/50 border border-white/12 text-xs text-white/70 hover:bg-black/70 hover:text-white transition-colors flex items-center gap-1.5 backdrop-blur-sm">
+                <ChevronRight size={12} className={`flex-shrink-0 transition-transform ${showDetails ? "-rotate-90" : "rotate-90"}`} />
+                <span className="whitespace-nowrap">{showDetails ? "Hide details" : "Details"}</span>
+              </button>
+            </div>
+          )}
         </div>
       </div>
 
-      <div className="grid grid-cols-1 xl:grid-cols-3 gap-5">
+      {/* Details drawer — everything the old in-shell page showed, on demand */}
+      <AnimatePresence>
+        {showDetails && (
+        <motion.div key="details" initial={{ y: "100%" }} animate={{ y: 0 }} exit={{ y: "100%" }} transition={{ duration: 0.25, ease: "easeOut" }}
+          className="absolute inset-x-0 bottom-0 max-h-[75%] overflow-y-auto border-t border-white/[0.08] backdrop-blur-xl"
+          style={{ background: "rgba(20,20,20,0.96)", scrollbarWidth: "thin" }}>
+        <div className="grid grid-cols-1 xl:grid-cols-3 gap-5 p-4 sm:p-6">
         <div className="xl:col-span-2 space-y-4">
-          {/* Player */}
-          <div className="relative rounded-2xl overflow-hidden bg-black aspect-video border border-white/8"
-            style={{ boxShadow: "0 12px 56px rgba(0,0,0,0.7)" }}>
-            {hasHls ? (
-              <>
-                <HlsPlayer src={v.hlsUrl!} poster={v.thumb} />
-                <div className="absolute top-3 right-3 flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-black/65 backdrop-blur-sm border border-white/10 text-xs font-mono text-emerald-400 pointer-events-none">
-                  <Radio size={10} />HLS · Adaptive
-                </div>
-              </>
-            ) : (
-              /* Fallback when HLS isn't ready yet */
-              <>
-                {v.thumb && <img src={v.thumb} alt={v.title} className="w-full h-full object-cover opacity-75" />}
-                <div className="absolute inset-0 bg-gradient-to-t from-black/85 via-transparent to-transparent" />
-                <div className="absolute inset-0 flex items-center justify-center">
-                  <div className="text-center space-y-3 px-6">
-                    <div className="w-16 h-16 rounded-full flex items-center justify-center border border-white/25 bg-white/10 backdrop-blur-md mx-auto">
-                      {v.status === "processing" || v.status === "encoding" as any
-                        ? <Loader2 size={22} className="text-white/60 animate-spin" />
-                        : <AlertCircle size={22} className="text-amber-400" />}
-                    </div>
-                    <p className="text-xs text-white/50 font-mono max-w-xs mx-auto">
-                      {v.status === "processing" || v.status === "encoding" as any
-                        ? "Encoding in progress. Video will start streaming automatically when ready."
-                        : v.status === "failed"
-                          ? "Encoding failed. Click Re-encode below to try again."
-                          : "HLS stream is being prepared…"}
-                    </p>
-                    {v.status === "failed" && (
-                      <button
-                        onClick={handleReEncode}
-                        className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold transition-colors inline-flex items-center gap-2"
-                      >
-                        <RefreshCw size={12} />Retry encoding
-                      </button>
-                    )}
-                  </div>
-                </div>
-                <div className="absolute top-3 right-3 flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-black/65 backdrop-blur-sm border border-white/10 text-xs font-mono text-amber-400">
-                  <Radio size={10} />{v.status === "failed" ? "Failed" : "Pending"}
-                </div>
-              </>
-            )}
-          </div>
-
           {/* Tabs */}
           <GlassCard className="p-0 overflow-hidden">
-            <div className="flex border-b border-white/[0.06]">
+            <div className="flex overflow-x-auto border-b border-white/[0.06]">
               {["details", "statistics", "encoding", "comments"].map(tab => (
                 <button key={tab} onClick={() => setActiveTab(tab)}
-                  className={`px-5 py-3 text-sm font-medium capitalize transition-all border-b-2 ${activeTab === tab ? "border-blue-500 text-white" : "border-transparent text-white/35 hover:text-white/60"}`}>
+                  className={`flex-shrink-0 px-4 sm:px-5 py-3 text-sm font-medium capitalize transition-all border-b-2 ${activeTab === tab ? "border-[var(--sv-accent)] text-white" : "border-transparent text-white/35 hover:text-white/60"}`}>
                   {tab}
                 </button>
               ))}
             </div>
-            <div className="p-5">
+            <div className="p-4 sm:p-5">
               {activeTab === "details" && (
-                <div className="grid grid-cols-2 gap-y-4 gap-x-6">
+                <div className="grid grid-cols-2 gap-y-4 gap-x-4 sm:gap-x-6">
                   {[["Title", v.title], ["Status", v.status], ["Duration", v.duration], ["Resolution", v.resolution], ["Codec", v.codec], ["File Size", v.size], ["Uploaded", v.uploadedAt], ["Views", (v.views ?? 0).toLocaleString()]].map(([k, val]) => (
-                    <div key={k as string}>
+                    <div key={k as string} className="min-w-0">
                       <p className="text-[10px] text-white/28 font-mono uppercase tracking-wider mb-1">{k}</p>
-                      <p className="text-sm text-white/80 capitalize">{val as string}</p>
+                      <p className="text-sm text-white/80 capitalize break-words">{val as string}</p>
                     </div>
                   ))}
                 </div>
@@ -1601,11 +1370,11 @@ function PlayerPage({ video, onBack }: { video: Video | null; onBack: () => void
                 <div className="space-y-4">
                   <div className="grid grid-cols-3 gap-4">
                     <div className="p-3 rounded-xl border border-white/8 text-center" style={{ background: "rgba(255,255,255,0.025)" }}>
-                      <p className="text-xl font-bold" style={{ color: "#2563eb", fontFamily: "'Outfit', sans-serif" }}>{(v.views ?? 0).toLocaleString()}</p>
+                      <p className="text-xl font-bold" style={{ color: "var(--sv-accent)", fontFamily: "'Outfit', sans-serif" }}>{(v.views ?? 0).toLocaleString()}</p>
                       <p className="text-xs text-white/35 mt-0.5">Total Views</p>
                     </div>
                     <div className="p-3 rounded-xl border border-white/8 text-center" style={{ background: "rgba(255,255,255,0.025)" }}>
-                      <p className="text-xl font-bold" style={{ color: "#4f46e5", fontFamily: "'Outfit', sans-serif" }}>{v.duration}</p>
+                      <p className="text-xl font-bold" style={{ color: "#d2d2d2", fontFamily: "'Outfit', sans-serif" }}>{v.duration}</p>
                       <p className="text-xs text-white/35 mt-0.5">Duration</p>
                     </div>
                     <div className="p-3 rounded-xl border border-white/8 text-center" style={{ background: "rgba(255,255,255,0.025)" }}>
@@ -1618,10 +1387,10 @@ function PlayerPage({ video, onBack }: { video: Video | null; onBack: () => void
               {activeTab === "encoding" && (
                 <div className="space-y-3">
                   {v.streams?.map((s: any) => (
-                    <div key={s.quality} className="flex items-center gap-3 p-3 rounded-xl border border-white/[0.05]" style={{ background: "rgba(255,255,255,0.018)" }}>
-                      <span className="text-sm font-bold text-white/75 font-mono w-12">{s.quality}</span>
-                      <span className="text-xs font-mono text-white/38 flex-1">{(s.bitrate / 1000).toFixed(0)} kbps</span>
-                      <span className="text-xs font-mono text-white/38">{s.size >= 1e9 ? `${(s.size/1e9).toFixed(1)} GB` : `${(s.size/1e6).toFixed(0)} MB`}</span>
+                    <div key={s.quality} className="flex flex-wrap items-center gap-x-3 gap-y-1.5 p-3 rounded-xl border border-white/[0.05]" style={{ background: "rgba(255,255,255,0.018)" }}>
+                      <span className="text-sm font-bold text-white/75 font-mono w-12 flex-shrink-0">{s.quality}</span>
+                      <span className="text-xs font-mono text-white/38 flex-1 min-w-0">{(s.bitrate / 1000).toFixed(0)} kbps</span>
+                      <span className="text-xs font-mono text-white/38 flex-shrink-0">{s.size >= 1e9 ? `${(s.size/1e9).toFixed(1)} GB` : `${(s.size/1e6).toFixed(0)} MB`}</span>
                       <StatusBadge status={s.status === "done" ? "published" : s.status} />
                     </div>
                   ))}
@@ -1689,15 +1458,18 @@ function PlayerPage({ video, onBack }: { video: Video | null; onBack: () => void
             </div>
           </GlassCard>
         </div>
-      </div>
+        </div>
+        </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* Thumbnail Selector Modal */}
       {showThumbnailSelector && thumbnailOptions.length > 0 && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm">
-          <div className="bg-[#0b0f1c] rounded-2xl border border-white/10 p-6 w-full max-w-3xl max-h-[80vh] overflow-auto">
-            <div className="flex items-center justify-between mb-4">
-              <h3 className="text-lg font-bold text-white">Select Thumbnail</h3>
-              <button onClick={() => setShowThumbnailSelector(false)} className="p-2 rounded-lg hover:bg-white/10 text-white/50 hover:text-white">
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm">
+          <div className="rounded-2xl border border-white/10 p-4 sm:p-6 w-full max-w-3xl max-h-[80vh] overflow-auto" style={{ background: "var(--sv-surface)" }}>
+            <div className="flex items-center justify-between gap-3 mb-4">
+              <h3 className="text-base sm:text-lg font-bold text-white truncate">Select Thumbnail</h3>
+              <button onClick={() => setShowThumbnailSelector(false)} className="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-lg hover:bg-white/10 text-white/50 hover:text-white">
                 <X size={20} />
               </button>
             </div>
@@ -1707,11 +1479,11 @@ function PlayerPage({ video, onBack }: { video: Video | null; onBack: () => void
                 <button
                   key={thumb.path}
                   onClick={() => handleSelectThumbnail(thumb.path)}
-                  className="relative group aspect-video rounded-xl overflow-hidden border-2 border-transparent hover:border-blue-500 transition-all"
+                  className="relative group aspect-video rounded-xl overflow-hidden border-2 border-transparent hover:border-[var(--sv-accent)] transition-all"
                 >
                   <img src={thumb.url} alt={`Thumbnail ${index + 1}`} className="w-full h-full object-cover" />
                   <div className="absolute inset-0 bg-black/50 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
-                    <span className="px-3 py-1.5 rounded-lg bg-blue-600 text-white text-xs font-medium">Select</span>
+                    <span className="px-3 py-1.5 rounded-lg bg-[var(--sv-accent)] text-white text-xs font-medium">Select</span>
                   </div>
                   <div className="absolute bottom-2 left-2 text-xs font-mono text-white/70 bg-black/50 px-1.5 py-0.5 rounded">
                     {Math.floor(thumb.timestamp)}s
@@ -1787,7 +1559,7 @@ function EncodingPage({ liveEvents = {}, online }: { liveEvents?: Record<string,
         </p>
       </div>
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-        <MetricCard icon={Cpu} label="Active Jobs" value={String(activeJobs)} sub="currently encoding" color="blue" />
+        <MetricCard icon={Cpu} label="Active Jobs" value={String(activeJobs)} sub="currently encoding" color="accent" />
         <MetricCard icon={Clock} label="Queued" value={String(queuedJobs)} sub="waiting for slot" color="amber" />
         <MetricCard icon={AlertTriangle} label="Failed" value={String(failedJobs)} sub="need attention" color="red" />
         <MetricCard icon={CheckCircle} label="Completed" value={String(totalJobs - activeJobs - queuedJobs - failedJobs)} sub="done today" color="emerald" />
@@ -1796,8 +1568,8 @@ function EncodingPage({ liveEvents = {}, online }: { liveEvents?: Record<string,
         {jobs.length > 0 ? jobs.map((job, i) => (
           <GlassCard key={i} className="p-5">
             <div className="flex items-start gap-4">
-              <div className={`p-2.5 rounded-xl flex-shrink-0 border ${job.status === "error" ? "bg-red-500/8 border-red-500/18" : job.status === "queued" ? "bg-white/4 border-white/8" : "bg-blue-500/8 border-blue-500/18"}`}>
-                {job.status === "encoding" ? <Loader2 size={17} className="text-blue-400 animate-spin" /> :
+              <div className={`p-2.5 rounded-xl flex-shrink-0 border ${job.status === "error" ? "bg-red-500/8 border-red-500/18" : job.status === "queued" ? "bg-white/4 border-white/8" : "bg-[var(--sv-accent-faint)] border-[var(--sv-accent-border)]"}`}>
+                {job.status === "encoding" ? <Loader2 size={17} className="text-[var(--sv-accent)] animate-spin" /> :
                  job.status === "error" ? <AlertCircle size={17} className="text-red-400" /> :
                  <Clock size={17} className="text-white/25" />}
               </div>
@@ -1811,19 +1583,19 @@ function EncodingPage({ liveEvents = {}, online }: { liveEvents?: Record<string,
                 </div>
                 <div className="flex items-center gap-4 text-xs font-mono text-white/30 mb-3">
                   <span>{job.stage}</span>
-                  {job.status === "encoding" && <><span className="text-blue-400/60">Speed: {job.speed}</span><span>ETA: {job.eta}</span></>}
+                  {job.status === "encoding" && <><span className="text-[var(--sv-accent-text)]">Speed: {job.speed}</span><span>ETA: {job.eta}</span></>}
                 </div>
                 {job.status === "encoding" && (
                   <div className="space-y-3">
-                    <ProgressBar value={job.pct} color="#2563eb" />
+                    <ProgressBar value={job.pct} color="var(--sv-accent)" />
                     <div className="grid grid-cols-2 gap-3">
                       <div>
                         <div className="flex justify-between text-[10px] font-mono text-white/28 mb-1"><span>CPU</span><span>{job.cpu}%</span></div>
-                        <ProgressBar value={job.cpu} color={job.cpu > 80 ? "#ef4444" : "#2563eb"} />
+                        <ProgressBar value={job.cpu} color={job.cpu > 80 ? "#ef4444" : "var(--sv-accent)"} />
                       </div>
                       <div>
                         <div className="flex justify-between text-[10px] font-mono text-white/28 mb-1"><span>Memory</span><span>{job.mem}%</span></div>
-                        <ProgressBar value={job.mem} color="#4f46e5" />
+                        <ProgressBar value={job.mem} color="#d2d2d2" />
                       </div>
                     </div>
                   </div>
@@ -1847,7 +1619,7 @@ function EncodingPage({ liveEvents = {}, online }: { liveEvents?: Record<string,
           </GlassCard>
         )) : (
           <GlassCard className="p-12 text-center">
-            <Loader2 size={32} className="animate-spin text-blue-500 mx-auto mb-4" />
+            <Loader2 size={32} className="animate-spin text-[var(--sv-accent)] mx-auto mb-4" />
             <p className="text-white/50">No encoding jobs</p>
             <p className="text-xs text-white/30 mt-1">Upload a video to start encoding</p>
           </GlassCard>
@@ -1879,9 +1651,9 @@ function StoragePage({ online }: { online: boolean | null }) {
         <p className="text-sm text-white/35 mt-0.5">{stats ? stats.provider : "local"} · {stats ? `${stats.totalVideos} videos` : "—"}</p>
       </div>
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-        <MetricCard icon={HardDrive} label="Source Files" value={stats ? fmtBytes(stats.totalSizeBytes) : "0 MB"} sub="original uploads" color="blue" />
-        <MetricCard icon={Database} label="Disk Used" value={stats ? fmtBytes(stats.diskUsedBytes) : "0 MB"} sub="incl. HLS + thumbs" color="indigo" />
-        <MetricCard icon={Download} label="Downloaded Today" value={stats ? fmtBytes(Math.floor(stats.totalSizeBytes * 0.1)) : "0 MB"} sub="estimated" color="cyan" />
+        <MetricCard icon={HardDrive} label="Source Files" value={stats ? fmtBytes(stats.totalSizeBytes) : "0 MB"} sub="original uploads" color="accent" />
+        <MetricCard icon={Database} label="Disk Used" value={stats ? fmtBytes(stats.diskUsedBytes) : "0 MB"} sub="incl. HLS + thumbs" color="crimson" />
+        <MetricCard icon={Download} label="Downloaded Today" value={stats ? fmtBytes(Math.floor(stats.totalSizeBytes * 0.1)) : "0 MB"} sub="estimated" color="neutral" />
         <MetricCard icon={Activity} label="Videos" value={stats ? String(stats.totalVideos) : "0"} sub="all statuses" color="emerald" />
       </div>
       {stats && (
@@ -1889,8 +1661,8 @@ function StoragePage({ online }: { online: boolean | null }) {
           <h3 className="text-sm font-semibold text-white/75 mb-5">Storage Breakdown</h3>
           <div className="space-y-3">
             {[
-              { name: "Source Files", value: stats.totalSizeBytes, color: "#2563eb" },
-              { name: "HLS Streams", value: Math.floor(stats.diskUsedBytes - stats.totalSizeBytes), color: "#4f46e5" },
+              { name: "Source Files", value: stats.totalSizeBytes, color: "#e50914" },
+              { name: "HLS Streams", value: Math.floor(stats.diskUsedBytes - stats.totalSizeBytes), color: "#d2d2d2" },
             ].map((s, i) => (
               <div key={i} className="flex items-center gap-3">
                 <span className="w-2 h-2 rounded-full flex-shrink-0" style={{ background: s.color }} />
@@ -1919,7 +1691,7 @@ function StoragePage({ online }: { online: boolean | null }) {
                   <img src={thumb} alt={title} className="w-10 h-6 rounded-lg object-cover bg-zinc-800 flex-shrink-0" />
                   <div className="flex-1 min-w-0">
                     <p className="text-xs text-white/60 truncate mb-1">{title}</p>
-                    <ProgressBar value={barPct} color="#2563eb" />
+                    <ProgressBar value={barPct} color="var(--sv-accent)" />
                   </div>
                   <span className="text-xs font-mono text-white/38 flex-shrink-0">{sizeLabel}</span>
                 </div>
@@ -1991,7 +1763,7 @@ function ChangePasswordCard() {
                 onChange={e => f.set(e.target.value)}
                 placeholder={f.placeholder}
                 onKeyDown={e => e.key === "Enter" && handleSubmit()}
-                className="w-full pl-10 pr-4 py-2.5 rounded-xl bg-white/5 border border-white/10 text-sm text-white placeholder-white/18 focus:outline-none focus:border-blue-500/45 transition-colors"
+                className="w-full pl-10 pr-4 py-2.5 rounded-xl bg-white/5 border border-white/10 text-sm text-white placeholder-white/18 focus:outline-none focus:border-[var(--sv-accent-border)] transition-colors"
               />
             </div>
           </div>
@@ -2000,7 +1772,7 @@ function ChangePasswordCard() {
       <div className="mt-4 flex items-center gap-4">
         <button onClick={handleSubmit} disabled={loading}
           className="px-5 py-2.5 rounded-xl text-white text-sm font-semibold hover:opacity-90 transition-all disabled:opacity-50 flex items-center gap-2"
-          style={{ background: "linear-gradient(135deg, #2563eb, #4f46e5)" }}>
+          style={{ background: "var(--sv-accent)" }}>
           {loading && <Loader2 size={13} className="animate-spin" />}Update Password
         </button>
         <button onClick={() => setShowPw(p => !p)} className="text-xs text-white/30 hover:text-white/55 transition-colors flex items-center gap-1.5">
@@ -2013,8 +1785,11 @@ function ChangePasswordCard() {
 
 // ─── Settings ─────────────────────────────────────────────────────────────────
 function SettingsPage({ user }: { user: AuthUser | null }) {
+  const isAdmin = user?.role === "admin";
   const [activeTab, setActiveTab] = useState("profile");
-  const tabs = ["profile", "api-keys", "ffmpeg", "security", "billing"];
+  // api-keys/ffmpeg are operational/admin concerns -- a regular subscriber only
+  // ever needs their profile, account security, and billing.
+  const tabs = isAdmin ? ["profile", "api-keys", "ffmpeg", "security", "billing"] : ["profile", "security", "billing"];
 
   // Profile form state pre-filled from real user
   const [profileName, setProfileName] = useState(user?.name ?? "");
@@ -2034,13 +1809,13 @@ function SettingsPage({ user }: { user: AuthUser | null }) {
   return (
     <div className="space-y-5">
       <div>
-        <h1 className="text-2xl font-bold text-white" style={{ fontFamily: "'Outfit', sans-serif" }}>Settings</h1>
+        <h1 className="text-xl sm:text-2xl font-bold text-white" style={{ fontFamily: "'Outfit', sans-serif" }}>Settings</h1>
         <p className="text-sm text-white/35 mt-0.5">Account and platform configuration</p>
       </div>
-      <div className="flex items-center gap-1 p-1 rounded-xl bg-white/5 border border-white/8 w-fit flex-wrap">
+      <div className="flex items-center gap-1 p-1 rounded-xl bg-white/5 border border-white/8 w-fit max-w-full flex-wrap">
         {tabs.map(t => (
           <button key={t} onClick={() => setActiveTab(t)}
-            className={`px-4 py-2 rounded-lg text-xs font-medium transition-all capitalize ${activeTab === t ? "bg-blue-600 text-white" : "text-white/38 hover:text-white/65"}`}>
+            className={`px-3 sm:px-4 min-h-[40px] rounded-lg text-xs font-medium transition-all capitalize ${activeTab === t ? "bg-[var(--sv-accent)] text-white" : "text-white/38 hover:text-white/65"}`}>
             {t.replace("-", " ")}
           </button>
         ))}
@@ -2053,7 +1828,7 @@ function SettingsPage({ user }: { user: AuthUser | null }) {
             <div>
               <label className="text-xs text-white/35 font-mono mb-1.5 block">Full Name</label>
               <input value={profileName} onChange={e => setProfileName(e.target.value)} type="text"
-                className="w-full px-4 py-2.5 rounded-xl bg-white/5 border border-white/10 text-sm text-white focus:outline-none focus:border-blue-500/45 transition-colors" />
+                className="w-full px-4 py-2.5 rounded-xl bg-white/5 border border-white/10 text-sm text-white focus:outline-none focus:border-[var(--sv-accent-border)] transition-colors" />
             </div>
             <div>
               <label className="text-xs text-white/35 font-mono mb-1.5 block">Email</label>
@@ -2063,7 +1838,7 @@ function SettingsPage({ user }: { user: AuthUser | null }) {
             <div>
               <label className="text-xs text-white/35 font-mono mb-1.5 block">Organization</label>
               <input value={profileOrg} onChange={e => setProfileOrg(e.target.value)} type="text"
-                className="w-full px-4 py-2.5 rounded-xl bg-white/5 border border-white/10 text-sm text-white focus:outline-none focus:border-blue-500/45 transition-colors" />
+                className="w-full px-4 py-2.5 rounded-xl bg-white/5 border border-white/10 text-sm text-white focus:outline-none focus:border-[var(--sv-accent-border)] transition-colors" />
             </div>
             <div>
               <label className="text-xs text-white/35 font-mono mb-1.5 block">Role</label>
@@ -2074,7 +1849,7 @@ function SettingsPage({ user }: { user: AuthUser | null }) {
           <div className="mt-5 flex items-center gap-3">
             <button onClick={handleSaveProfile} disabled={saving}
               className="px-5 py-2.5 rounded-xl text-white text-sm font-semibold hover:opacity-90 transition-all disabled:opacity-50 flex items-center gap-2"
-              style={{ background: "linear-gradient(135deg, #2563eb, #4f46e5)" }}>
+              style={{ background: "var(--sv-accent)" }}>
               {saving && <Loader2 size={13} className="animate-spin" />}Save Changes
             </button>
             {saveMsg && <span className="text-xs text-emerald-400 font-mono flex items-center gap-1"><Check size={12} />{saveMsg}</span>}
@@ -2086,7 +1861,7 @@ function SettingsPage({ user }: { user: AuthUser | null }) {
         <GlassCard className="p-6">
           <div className="flex items-center justify-between mb-5">
             <h3 className="text-sm font-semibold text-white/75">API Keys</h3>
-            <button className="flex items-center gap-2 px-3 py-2 rounded-xl bg-blue-600/15 border border-blue-500/25 text-xs text-blue-400 hover:bg-blue-600/25 transition-colors">
+            <button className="flex items-center gap-2 px-3 py-2 rounded-xl bg-[var(--sv-accent-soft)] border border-[var(--sv-accent-border)] text-xs text-[var(--sv-accent-text)] hover:bg-[var(--sv-accent)] hover:text-white transition-colors">
               <Plus size={12} />Generate Key
             </button>
           </div>
@@ -2105,12 +1880,12 @@ function SettingsPage({ user }: { user: AuthUser | null }) {
               <div key={l}>
                 <label className="text-xs text-white/35 font-mono mb-1.5 block">{l}</label>
                 <input defaultValue={v}
-                  className="w-full px-4 py-2.5 rounded-xl bg-white/5 border border-white/10 text-sm text-white font-mono focus:outline-none focus:border-blue-500/45 transition-colors" />
+                  className="w-full px-4 py-2.5 rounded-xl bg-white/5 border border-white/10 text-sm text-white font-mono focus:outline-none focus:border-[var(--sv-accent-border)] transition-colors" />
               </div>
             ))}
           </div>
           <button className="mt-5 px-5 py-2.5 rounded-xl text-white text-sm font-semibold hover:opacity-90 transition-all"
-            style={{ background: "linear-gradient(135deg, #2563eb, #4f46e5)" }}>Save FFmpeg Config</button>
+            style={{ background: "var(--sv-accent)" }}>Save FFmpeg Config</button>
         </GlassCard>
       )}
 
@@ -2119,17 +1894,17 @@ function SettingsPage({ user }: { user: AuthUser | null }) {
           <ChangePasswordCard />
           <GlassCard className="p-6">
             <h3 className="text-sm font-semibold text-white/75 mb-5">Two-Factor Authentication</h3>
-            <div className="flex items-center justify-between p-4 rounded-xl border border-white/[0.06]" style={{ background: "rgba(255,255,255,0.02)" }}>
-              <div className="flex items-center gap-3">
-                <div className="p-2 rounded-lg bg-emerald-500/10 border border-emerald-500/18">
+            <div className="flex flex-wrap items-center justify-between gap-3 p-4 rounded-xl border border-white/[0.06]" style={{ background: "rgba(255,255,255,0.02)" }}>
+              <div className="flex min-w-0 items-center gap-3">
+                <div className="p-2 rounded-lg bg-emerald-500/10 border border-emerald-500/18 flex-shrink-0">
                   <ShieldCheck size={15} className="text-emerald-400" />
                 </div>
-                <div>
-                  <p className="text-sm font-medium text-white">Authenticator App</p>
-                  <p className="text-xs text-emerald-400 font-mono mt-0.5">Enabled · TOTP</p>
+                <div className="min-w-0">
+                  <p className="text-sm font-medium text-white truncate">Authenticator App</p>
+                  <p className="text-xs text-emerald-400 font-mono mt-0.5 truncate">Enabled · TOTP</p>
                 </div>
               </div>
-              <button className="px-3 py-1.5 rounded-lg text-xs text-white/45 bg-white/5 border border-white/8 hover:bg-white/8 transition-colors">Manage</button>
+              <button className="px-3 min-h-[40px] flex-shrink-0 rounded-lg text-xs text-white/45 bg-white/5 border border-white/8 hover:bg-white/8 transition-colors">Manage</button>
             </div>
           </GlassCard>
           <GlassCard className="p-6">
@@ -2142,15 +1917,15 @@ function SettingsPage({ user }: { user: AuthUser | null }) {
       )}
 
       {activeTab === "billing" && (
-        <GlassCard className="p-12 text-center">
-          <div className="w-14 h-14 rounded-2xl bg-blue-500/10 border border-blue-500/18 flex items-center justify-center mx-auto mb-4">
-            <Shield size={22} className="text-blue-400" />
+        <GlassCard className="p-8 sm:p-12 text-center">
+          <div className="w-14 h-14 rounded-2xl bg-[var(--sv-accent-soft)] border border-[var(--sv-accent-border)] flex items-center justify-center mx-auto mb-4">
+            <Shield size={22} className="text-[var(--sv-accent)]" />
           </div>
           <h3 className="text-lg font-bold text-white mb-2" style={{ fontFamily: "'Outfit', sans-serif" }}>Business Plan</h3>
           <p className="text-sm text-white/40 mb-4">5 TB storage · Unlimited encoding · Priority support</p>
           <p className="text-3xl font-bold text-white" style={{ fontFamily: "'Outfit', sans-serif" }}>$299<span className="text-sm font-normal text-white/35">/mo</span></p>
           <button className="mt-6 px-6 py-2.5 rounded-xl text-white text-sm font-semibold hover:opacity-90 transition-all"
-            style={{ background: "linear-gradient(135deg, #2563eb, #4f46e5)" }}>Manage Billing</button>
+            style={{ background: "var(--sv-accent)" }}>Manage Billing</button>
         </GlassCard>
       )}
     </div>
@@ -2188,10 +1963,10 @@ function AdminPage({ online }: { online: boolean | null }) {
         <p className="text-sm text-white/35 mt-0.5">Platform health · Users · Infrastructure</p>
       </div>
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-        <MetricCard icon={Users} label="Total Users" value={adminStats?.users != null ? String(adminStats.users) : "0"} sub="registered accounts" color="blue" />
+        <MetricCard icon={Users} label="Total Users" value={adminStats?.users != null ? String(adminStats.users) : "0"} sub="registered accounts" color="accent" />
         <MetricCard icon={Film} label="Total Videos" value={adminStats?.videos != null ? String(adminStats.videos) : "0"} sub={adminStats?.encodingJobs != null ? `${adminStats.encodingJobs} encoding` : "across library"} color="emerald" />
         <MetricCard icon={AlertTriangle} label="Failed Jobs" value={adminStats?.failedJobs != null ? String(adminStats.failedJobs) : "0"} sub="need attention" color="red" />
-        <MetricCard icon={Activity} label="Active Uploads" value={adminStats?.activeSessions != null ? String(adminStats.activeSessions) : "0"} sub="in-progress sessions" color="cyan" />
+        <MetricCard icon={Activity} label="Active Uploads" value={adminStats?.activeSessions != null ? String(adminStats.activeSessions) : "0"} sub="in-progress sessions" color="neutral" />
       </div>
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <GlassCard className="p-5">
@@ -2202,7 +1977,7 @@ function AdminPage({ online }: { online: boolean | null }) {
             {userList.length > 0 ? userList.map(u => (
               <div key={u._id} className="flex items-center gap-3 p-3 rounded-xl hover:bg-white/[0.03] transition-colors">
                 <div className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold text-white flex-shrink-0"
-                  style={{ background: "linear-gradient(135deg, #2563eb, #4f46e5)" }}>
+                  style={{ background: "var(--sv-accent)" }}>
                   {u.name?.charAt(0) ?? "?"}
                 </div>
                 <div className="flex-1 min-w-0">
@@ -2245,63 +2020,101 @@ function AdminPage({ online }: { online: boolean | null }) {
 }
 
 // ─── Sidebar ──────────────────────────────────────────────────────────────────
-const navItems = [
-  { id: "dashboard", icon: LayoutDashboard, label: "Dashboard" },
-  { id: "upload",    icon: Upload,          label: "Upload Center" },
-  { id: "library",   icon: Film,            label: "Video Library" },
-  { id: "encoding",  icon: Cpu,             label: "Encoding" },
-  { id: "storage",   icon: HardDrive,       label: "Storage" },
-  { id: "settings",  icon: Settings,        label: "Settings" },
-  { id: "admin",     icon: Shield,          label: "Admin" },
+interface NavItem { to: string; icon: React.ElementType; label: string; end?: boolean }
+
+// Everything a regular (non-admin) user gets — a pure consumption surface.
+// Ingest deliberately isn't here: uploading is an admin capability.
+const userNavItems: NavItem[] = [
+  { to: "/",         icon: Home,     label: "Home", end: true },
+  { to: "/live",     icon: Radio,    label: "Live TV" },
+  { to: "/library",  icon: Film,     label: "Video Library" },
+  { to: "/settings", icon: Settings, label: "Settings" },
 ];
 
-function Sidebar({ page, setPage, collapsed, setCollapsed, user, onLogout }: { page: Page; setPage: (p: Page) => void; collapsed: boolean; setCollapsed: (v: boolean) => void; user: AuthUser | null; onLogout: () => void }) {
+// Ops/ingest/analytics surfaces — only ever built into the nav for admins.
+// The actual security boundary is the RequireAdmin route guard, not this list.
+const adminNavItems: NavItem[] = [
+  { to: "/admin",           icon: Shield,          label: "Admin", end: true },
+  { to: "/admin/dashboard", icon: LayoutDashboard, label: "Dashboard" },
+  { to: "/admin/upload",    icon: Upload,          label: "Upload Center" },
+  { to: "/admin/encoding",  icon: Cpu,             label: "Encoding" },
+  { to: "/admin/storage",   icon: HardDrive,       label: "Storage" },
+  { to: "/admin/live",      icon: Tv,              label: "Live Channels" },
+];
+
+function SidebarLink({ item, collapsed }: { item: NavItem; collapsed: boolean }) {
+  return (
+    <NavLink
+      to={item.to}
+      end={item.end}
+      className={({ isActive }) =>
+        `w-full flex items-center gap-3 px-3 py-2.5 mb-0.5 rounded-xl transition-all relative ${isActive ? "text-white" : "text-white/35 hover:text-white/60 hover:bg-white/[0.04]"}`}
+    >
+      {({ isActive }) => (
+        <>
+          {isActive && <motion.div layoutId="sidebarActive" className="absolute inset-0 rounded-xl" style={{ background: "var(--sv-accent-soft)", border: "1px solid var(--sv-accent-soft)" }} />}
+          <item.icon size={16} className="flex-shrink-0 relative z-10" style={{ color: isActive ? "var(--sv-accent-text)" : undefined }} />
+          <AnimatePresence>
+            {!collapsed && (
+              <motion.span initial={{ opacity: 0, x: -6 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -6 }} transition={{ duration: 0.12 }}
+                className="text-sm font-medium relative z-10 whitespace-nowrap">{item.label}</motion.span>
+            )}
+          </AnimatePresence>
+          {isActive && !collapsed && <div className="w-1.5 h-1.5 rounded-full bg-[var(--sv-accent)] ml-auto relative z-10 flex-shrink-0" />}
+        </>
+      )}
+    </NavLink>
+  );
+}
+
+function Sidebar({ collapsed, setCollapsed, user, onLogout, hasNavbarAbove = true }: { collapsed: boolean; setCollapsed: (v: boolean) => void; user: AuthUser | null; onLogout: () => void; hasNavbarAbove?: boolean }) {
+  const isAdmin = user?.role === "admin";
   return (
     <motion.aside animate={{ width: collapsed ? 64 : 232 }} transition={{ type: "spring", stiffness: 320, damping: 32 }}
-      className="flex-shrink-0 h-screen sticky top-0 flex flex-col border-r border-white/[0.06] overflow-hidden"
-      style={{ background: "#0b0f1c" }}>
-      {/* Logo */}
-      <div className="flex items-center gap-3 px-4 py-5 border-b border-white/[0.05] flex-shrink-0">
-        <div className="w-8 h-8 rounded-xl flex-shrink-0 flex items-center justify-center"
-          style={{ background: "linear-gradient(135deg, #2563eb, #4f46e5)" }}>
-          <Play size={13} fill="white" className="text-white ml-0.5" />
+      className={`flex-shrink-0 sticky flex flex-col border-r border-white/[0.06] overflow-hidden ${
+        hasNavbarAbove ? "top-14 sm:top-16 h-[calc(100vh-56px)] sm:h-[calc(100vh-64px)]" : "top-0 h-screen"}`}
+      style={{ background: "var(--sv-surface)" }}>
+      {/* The fixed UserNavBar above already shows the wordmark when present —
+          only draw our own logo header when this sidebar has to stand alone. */}
+      {!hasNavbarAbove && (
+        <div className="flex items-center gap-3 px-4 py-5 border-b border-white/[0.05] flex-shrink-0">
+          <Link to="/" className="flex items-center gap-3">
+            <div className="w-8 h-8 rounded-xl flex-shrink-0 flex items-center justify-center" style={{ background: "var(--sv-accent)" }}>
+              <Play size={13} fill="white" className="text-white ml-0.5" />
+            </div>
+            <AnimatePresence>
+              {!collapsed && (
+                <motion.span initial={{ opacity: 0, x: -8 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -8 }} transition={{ duration: 0.15 }}
+                  className="font-bold text-white text-lg whitespace-nowrap" style={{ fontFamily: "'Outfit', sans-serif" }}>
+                  StreamVault
+                </motion.span>
+              )}
+            </AnimatePresence>
+          </Link>
         </div>
-        <AnimatePresence>
-          {!collapsed && (
-            <motion.span initial={{ opacity: 0, x: -8 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -8 }} transition={{ duration: 0.15 }}
-              className="font-bold text-white text-lg whitespace-nowrap" style={{ fontFamily: "'Outfit', sans-serif" }}>
-              StreamVault
-            </motion.span>
-          )}
-        </AnimatePresence>
-      </div>
-
+      )}
       {/* Nav */}
       <nav className="flex-1 py-3 px-2 overflow-y-auto">
-        {navItems.filter(item => item.id !== "admin" || user?.role === "admin").map(item => {
-          const active = page === item.id;
-          return (
-            <button key={item.id} onClick={() => setPage(item.id as Page)}
-              className={`w-full flex items-center gap-3 px-3 py-2.5 mb-0.5 rounded-xl transition-all relative ${active ? "text-white" : "text-white/35 hover:text-white/60 hover:bg-white/[0.04]"}`}>
-              {active && <motion.div layoutId="sidebarActive" className="absolute inset-0 rounded-xl" style={{ background: "rgba(37,99,235,0.18)", border: "1px solid rgba(37,99,235,0.25)" }} />}
-              <item.icon size={16} className="flex-shrink-0 relative z-10" style={{ color: active ? "#60a5fa" : undefined }} />
-              <AnimatePresence>
-                {!collapsed && (
-                  <motion.span initial={{ opacity: 0, x: -6 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -6 }} transition={{ duration: 0.12 }}
-                    className="text-sm font-medium relative z-10 whitespace-nowrap">{item.label}</motion.span>
-                )}
-              </AnimatePresence>
-              {active && !collapsed && <div className="w-1.5 h-1.5 rounded-full bg-blue-400 ml-auto relative z-10 flex-shrink-0" />}
-            </button>
-          );
-        })}
+        {userNavItems.map(item => <SidebarLink key={item.to} item={item} collapsed={collapsed} />)}
+
+        {/* Admin section is simply not built for non-admins — no post-hoc filtering. */}
+        {isAdmin && (
+          <>
+            <div className="mt-4 mb-1 px-3 h-4 flex items-center">
+              {!collapsed
+                ? <span className="text-[9.5px] font-mono font-semibold uppercase tracking-widest text-white/22">Admin</span>
+                : <span className="w-full h-px bg-white/[0.07]" />}
+            </div>
+            {adminNavItems.map(item => <SidebarLink key={item.to} item={item} collapsed={collapsed} />)}
+          </>
+        )}
       </nav>
 
       {/* Footer */}
       <div className="p-2 border-t border-white/[0.05] flex-shrink-0">
         <div className="flex items-center gap-2.5 px-2 py-2 rounded-xl hover:bg-white/[0.04] cursor-pointer transition-colors" onClick={onLogout} title="Sign out">
           <div className="w-7 h-7 rounded-full flex-shrink-0 flex items-center justify-center text-xs font-bold text-white"
-            style={{ background: "linear-gradient(135deg, #2563eb, #4f46e5)" }}>
+            style={{ background: "var(--sv-accent)" }}>
             {user?.name ? user.name.charAt(0).toUpperCase() : "?"}
           </div>
           <AnimatePresence>
@@ -2322,54 +2135,302 @@ function Sidebar({ page, setPage, collapsed, setCollapsed, user, onLogout }: { p
   );
 }
 
-// ─── Top Bar ──────────────────────────────────────────────────────────────────
-function TopBar({ online, user }: { online: boolean | null; user: AuthUser | null }) {
+// ─── User top navbar (Netflix-style) ──────────────────────────────────────────
+// Netflix's browse UI is a slim horizontal bar, not a left rail, so the regular
+// viewer surfaces (`/`, `/live`, `/library`, `/settings`) render this with no
+// `Sidebar` at all. `AppShell` (the `/admin/*` subtree) renders this SAME bar
+// plus `Sidebar` beneath it, so admins always have a way back to the regular
+// browse experience — only `Sidebar`'s admin-tools column is exclusive to that
+// shell, not the navbar itself.
+
+// Inline primary destinations. Derived from `userNavItems` so the routes stay
+// declared exactly once — Settings is deliberately excluded here and lives in
+// the avatar dropdown instead, mirroring Netflix's account menu.
+const primaryNavItems = userNavItems.filter(i => i.to !== "/settings");
+
+function NavBarLink({ item }: { item: NavItem }) {
   return (
-    <header className="h-14 flex-shrink-0 flex items-center justify-between px-6 border-b border-white/[0.05]"
-      style={{ background: "rgba(8,11,20,0.92)", backdropFilter: "blur(12px)" }}>
-      <div className="flex-1 max-w-sm">
-        <div className="relative">
-          <Search size={13} className="absolute left-3 top-1/2 -translate-y-1/2 text-white/22" />
-          <input placeholder="Search videos, uploads, logs…"
-            className="w-full pl-9 pr-4 py-2 rounded-lg bg-white/[0.05] border border-white/[0.08] text-xs text-white placeholder-white/22 focus:outline-none focus:border-blue-500/38 transition-colors" />
-        </div>
-      </div>
-      <div className="flex items-center gap-2">
-        {/* Backend status pill */}
-        <div className={`hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-[10px] font-mono font-semibold transition-all ${
-          online === null ? "bg-white/4 border-white/8 text-white/28" :
-          online ? "bg-emerald-500/10 border-emerald-500/20 text-emerald-400" :
-          "bg-amber-500/10 border-amber-500/20 text-amber-400"
-        }`}>
-          <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
-            online === null ? "bg-white/25" :
-            online ? "bg-emerald-400 animate-pulse" : "bg-amber-400"
-          }`} />
-          {online === null ? "checking…" : online ? "API online" : "offline"}
-        </div>
-        <button className="relative p-2 rounded-lg hover:bg-white/[0.06] text-white/35 hover:text-white/65 transition-colors">
-          <Bell size={15} />
-          <span className="absolute top-1.5 right-1.5 w-1.5 h-1.5 rounded-full bg-blue-500" />
+    <NavLink
+      to={item.to}
+      {...(item.end ? { end: item.end } : {})}
+      className={({ isActive }) =>
+        `relative whitespace-nowrap py-1 text-sm transition-colors ${isActive ? "font-semibold text-white" : "font-medium text-white/60 hover:text-white"}`}
+    >
+      {({ isActive }) => (
+        <>
+          {item.label}
+          {/* Plain (non-`layoutId`) underline: the mobile drawer renders the same
+              routes, and two live elements sharing a layoutId fight each other. */}
+          {isActive && (
+            <span className="absolute inset-x-0 -bottom-0.5 h-0.5 rounded-full" style={{ background: "var(--sv-accent)" }} />
+          )}
+        </>
+      )}
+    </NavLink>
+  );
+}
+
+function UserNavBar({ user, online, onLogout, forceSolid = false }: { user: AuthUser | null; online: boolean | null; onLogout: () => void; forceSolid?: boolean }) {
+  const location = useLocation();
+  const isAdmin = user?.role === "admin";
+  const [scrolled, setScrolled] = useState(false);
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [mobileSearchOpen, setMobileSearchOpen] = useState(false);
+  const [userMenuOpen, setUserMenuOpen] = useState(false);
+  const userMenuRef = useRef<HTMLDivElement>(null);
+
+  // Netflix blends its bar into the artwork at the top of the page and drops a
+  // solid background in once you scroll. The shell scrolls the document (not an
+  // inner pane), so a plain window listener is enough.
+  useEffect(() => {
+    const onScroll = () => setScrolled(window.scrollY > 12);
+    onScroll();
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, []);
+
+  // Any navigation collapses whatever was expanded.
+  useEffect(() => {
+    setMobileNavOpen(false);
+    setMobileSearchOpen(false);
+    setUserMenuOpen(false);
+  }, [location.pathname]);
+
+  useEffect(() => {
+    if (!userMenuOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (userMenuRef.current && !userMenuRef.current.contains(e.target as Node)) setUserMenuOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [userMenuOpen]);
+
+  // Admin pages scroll inside their own <main>, not the document, so the
+  // scroll-driven transparent-over-hero treatment never has anything to react
+  // to there -- force a solid bar instead of leaving it permanently see-through.
+  const solid = forceSolid || scrolled || mobileNavOpen || mobileSearchOpen;
+  const iconBtn = "flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-full text-white/65 transition-colors hover:bg-white/10 hover:text-white";
+
+  return (
+    <header
+      className="fixed inset-x-0 top-0 z-50 transition-colors duration-300"
+      style={solid
+        ? { background: "rgba(20,20,20,0.97)", backdropFilter: "blur(14px)", borderBottom: "1px solid var(--sv-border)" }
+        : { background: "linear-gradient(to bottom, rgba(0,0,0,0.85) 0%, rgba(0,0,0,0.45) 55%, rgba(0,0,0,0) 100%)", borderBottom: "1px solid transparent" }}
+    >
+      <div className="relative flex h-14 items-center gap-1.5 px-3 sm:h-16 sm:gap-4 sm:px-6 lg:px-10">
+        {/* Mobile menu toggle — the primary links collapse behind this below md */}
+        <button
+          type="button"
+          aria-label={mobileNavOpen ? "Close menu" : "Open menu"}
+          aria-expanded={mobileNavOpen}
+          onClick={() => { setMobileNavOpen(o => !o); setMobileSearchOpen(false); setUserMenuOpen(false); }}
+          className={`${iconBtn} md:hidden`}
+        >
+          {mobileNavOpen ? <X size={18} /> : <Menu size={18} />}
         </button>
-        {user && (
-          <div className="hidden md:flex items-center gap-1.5 pl-2 border-l border-white/[0.07]">
-            <span className="text-[11px] text-white/35 font-mono">{user.email}</span>
+
+        {/* Wordmark — same red play tile the sidebar uses */}
+        <Link to="/" className="flex flex-shrink-0 items-center gap-2">
+          <span className="flex h-8 w-8 items-center justify-center rounded-lg" style={{ background: "var(--sv-accent)" }}>
+            <Play size={13} fill="white" className="ml-0.5 text-white" />
+          </span>
+          <span className="hidden text-lg font-bold text-white sm:inline lg:text-xl" style={{ fontFamily: "'Outfit', sans-serif" }}>
+            StreamVault
+          </span>
+        </Link>
+
+        {/* Primary links centered in the bar regardless of logo/right-cluster width. */}
+        <nav className="absolute left-1/2 hidden -translate-x-1/2 items-center gap-5 md:flex lg:gap-7">
+          {primaryNavItems.map(item => <NavBarLink key={item.to} item={item} />)}
+        </nav>
+
+        <div className="ml-auto flex min-w-0 items-center gap-0.5 sm:gap-1.5">
+          {/* Desktop search — expands on focus */}
+          <div className="relative hidden md:block">
+            <Search size={13} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-white/35" />
+            <input
+              placeholder="Titles, channels…"
+              className="w-40 rounded-lg border border-white/[0.12] bg-black/50 py-2 pl-9 pr-3 text-xs text-white placeholder-white/25 transition-[width,border-color] duration-300 focus:w-56 focus:border-[var(--sv-accent-border)] focus:outline-none lg:w-52 lg:focus:w-72"
+            />
           </div>
-        )}
+          {/* Mobile search — icon that expands into a full-width row */}
+          <button
+            type="button"
+            aria-label="Search"
+            aria-expanded={mobileSearchOpen}
+            onClick={() => { setMobileSearchOpen(o => !o); setMobileNavOpen(false); }}
+            className={`${iconBtn} md:hidden`}
+          >
+            <Search size={17} />
+          </button>
+
+          {/* Backend status pill — an ops detail, admin-only */}
+          {isAdmin && (
+            <div className={`hidden items-center gap-1.5 rounded-lg border px-2.5 py-1 font-mono text-[10px] font-semibold transition-all lg:flex ${
+              online === null ? "border-white/8 bg-white/4 text-white/28" :
+              online ? "border-emerald-500/20 bg-emerald-500/10 text-emerald-400" :
+              "border-amber-500/20 bg-amber-500/10 text-amber-400"
+            }`}>
+              <span className={`h-1.5 w-1.5 flex-shrink-0 rounded-full ${
+                online === null ? "bg-white/25" : online ? "animate-pulse bg-emerald-400" : "bg-amber-400"
+              }`} />
+              {online === null ? "checking…" : online ? "API online" : "offline"}
+            </div>
+          )}
+
+          <button type="button" aria-label="Notifications" className={`relative ${iconBtn}`}>
+            <Bell size={17} />
+            <span className="absolute right-2 top-2 h-1.5 w-1.5 rounded-full" style={{ background: "var(--sv-accent)" }} />
+          </button>
+
+          {/* Profile menu */}
+          <div className="relative flex-shrink-0" ref={userMenuRef}>
+            <button
+              type="button"
+              aria-label="Account menu"
+              aria-expanded={userMenuOpen}
+              onClick={() => { setUserMenuOpen(o => !o); setMobileNavOpen(false); setMobileSearchOpen(false); }}
+              className="flex h-10 items-center gap-1 rounded-full pl-0.5 pr-1 transition-colors hover:bg-white/10"
+            >
+              <span className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-full text-xs font-bold text-white"
+                style={{ background: "var(--sv-accent)" }}>
+                {user?.name ? user.name.charAt(0).toUpperCase() : "?"}
+              </span>
+              <ChevronDown size={13} className={`hidden text-white/45 transition-transform duration-200 sm:block ${userMenuOpen ? "rotate-180" : ""}`} />
+            </button>
+
+            <AnimatePresence>
+              {userMenuOpen && (
+                <motion.div
+                  key="user-menu"
+                  initial={{ opacity: 0, y: -6 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -6 }}
+                  transition={{ duration: 0.14, ease: "easeOut" }}
+                  className="absolute right-0 top-full z-50 mt-2 w-56 max-w-[calc(100vw-1.5rem)] overflow-hidden rounded-xl border border-white/[0.1] shadow-2xl"
+                  style={{ background: "rgba(24,24,24,0.98)", backdropFilter: "blur(16px)" }}
+                >
+                  <div className="border-b border-white/[0.07] px-4 py-3">
+                    <p className="truncate text-sm font-semibold text-white">{user?.name ?? "—"}</p>
+                    <p className="truncate font-mono text-[11px] text-white/38">{user?.email ?? ""}</p>
+                    <span className="mt-1.5 inline-block rounded-md border border-white/10 bg-white/5 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-white/45">
+                      {user?.role ?? "—"}
+                    </span>
+                  </div>
+                  <div className="p-1.5">
+                    <Link to="/settings" onClick={() => setUserMenuOpen(false)}
+                      className="flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm text-white/65 transition-colors hover:bg-white/[0.07] hover:text-white">
+                      <Settings size={15} className="flex-shrink-0" />Settings
+                    </Link>
+                    <button type="button" onClick={() => { setUserMenuOpen(false); onLogout(); }}
+                      className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm text-white/65 transition-colors hover:bg-[var(--sv-accent-faint)] hover:text-[var(--sv-accent-text)]">
+                      <LogOut size={15} className="flex-shrink-0" />Sign out
+                    </button>
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </div>
+        </div>
       </div>
+
+      {/* Expanded mobile search row */}
+      <AnimatePresence>
+        {mobileSearchOpen && (
+          <motion.div key="mobile-search" initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }} exit={{ opacity: 0, height: 0 }}
+            transition={{ duration: 0.16, ease: "easeOut" }}
+            className="overflow-hidden border-t border-white/[0.06] md:hidden">
+            <div className="relative px-3 py-2.5">
+              <Search size={14} className="pointer-events-none absolute left-6 top-1/2 -translate-y-1/2 text-white/35" />
+              <input
+                autoFocus
+                placeholder="Search titles, channels…"
+                className="w-full rounded-lg border border-white/[0.12] bg-black/50 py-2.5 pl-9 pr-3 text-sm text-white placeholder-white/25 focus:border-[var(--sv-accent-border)] focus:outline-none"
+              />
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Mobile nav drawer */}
+      <AnimatePresence>
+        {mobileNavOpen && (
+          <motion.nav key="mobile-nav" initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }} exit={{ opacity: 0, height: 0 }}
+            transition={{ duration: 0.18, ease: "easeOut" }}
+            className="overflow-hidden border-t border-white/[0.06] md:hidden">
+            <div className="space-y-1 px-3 py-3">
+              {userNavItems.map(item => (
+                <NavLink
+                  key={item.to}
+                  to={item.to}
+                  {...(item.end ? { end: item.end } : {})}
+                  onClick={() => setMobileNavOpen(false)}
+                  className={({ isActive }) =>
+                    `flex items-center gap-3 rounded-xl px-3 py-3 text-sm transition-colors ${
+                      isActive ? "font-semibold text-white" : "text-white/60 hover:bg-white/[0.05] hover:text-white"}`}
+                  style={({ isActive }) => (isActive ? { background: "var(--sv-accent-soft)" } : {})}
+                >
+                  <item.icon size={16} className="flex-shrink-0" />
+                  <span className="truncate">{item.label}</span>
+                </NavLink>
+              ))}
+            </div>
+          </motion.nav>
+        )}
+      </AnimatePresence>
     </header>
+  );
+}
+
+// ─── User shell (top navbar + routed <Outlet/>, no sidebar column) ────────────
+// ─── App shell (navbar always; sidebar too, for admins, on every page) ────────
+// Admins expect their tools reachable from wherever they are, not just inside
+// a separate /admin subtree, so the sidebar's presence is role-driven, not
+// route-driven — everyone gets the same navbar, and it's just a plain flex
+// sibling next to the routed content rather than a second, route-gated shell.
+function AppShell({ user, online, collapsed, setCollapsed, onLogout }: {
+  user: AuthUser | null;
+  online: boolean | null;
+  collapsed: boolean;
+  setCollapsed: (v: boolean) => void;
+  onLogout: () => void;
+}) {
+  const location = useLocation();
+  const isAdmin = user?.role === "admin";
+  // The sidebar already links back to Home/Live/Library/Settings (plus every
+  // admin tool), so a second top bar duplicating those same links is just
+  // clutter once you're inside the admin section itself.
+  const inAdminSection = location.pathname.startsWith("/admin");
+  const showNavbar = !inAdminSection;
+
+  if (!user) return <Navigate to="/login" replace />;
+
+  return (
+    <div className="min-h-screen w-full overflow-x-hidden" style={{ background: "var(--sv-bg)", fontFamily: "'Inter', sans-serif" }}>
+      {showNavbar && <UserNavBar user={user} online={online} onLogout={onLogout} forceSolid={isAdmin} />}
+      {/* Top padding clears the fixed navbar (h-14 mobile / h-16 from sm up) —
+          only needed when the navbar is actually rendered above this row. */}
+      <div className={`flex ${showNavbar ? "pt-14 sm:pt-16" : ""}`}>
+        {isAdmin && <Sidebar collapsed={collapsed} setCollapsed={setCollapsed} user={user} onLogout={onLogout} hasNavbarAbove={showNavbar} />}
+        <main className="min-w-0 flex-1 px-4 pb-12 pt-6 sm:px-6 lg:px-10">
+          <AnimatePresence mode="wait">
+            <motion.div key={location.pathname} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -6 }} transition={{ duration: 0.18, ease: "easeOut" }}>
+              <Outlet />
+            </motion.div>
+          </AnimatePresence>
+        </main>
+      </div>
+    </div>
   );
 }
 
 // ─── Root ─────────────────────────────────────────────────────────────────────
 export default function App() {
+  const navigate = useNavigate();
   const [user, setUser] = useState<AuthUser | null>(null);
   // If no token is stored we already know — skip the async check entirely
   const hasStoredToken = (() => { try { return !!localStorage.getItem("sv_token"); } catch { return false; } })();
   const [authChecked, setAuthChecked] = useState(!hasStoredToken);
-  const [page, setPage] = useState<Page>("dashboard");
   const [collapsed, setCollapsed] = useState(false);
-  const [activeVideo, setActiveVideo] = useState<Video | null>(null);
   const [liveEncoding, setLiveEncoding] = useState<Record<string, EncodingProgressEvent>>({});
   const [online, setOnline] = useState<boolean | null>(null);
 
@@ -2414,59 +2475,65 @@ export default function App() {
 
   const handleLogin = useCallback((u: AuthUser) => {
     setUser(u);
-    setPage("dashboard");
-  }, []);
+    navigate("/", { replace: true });
+  }, [navigate]);
 
   const handleLogout = useCallback(() => {
     authApi.logout();
     setUser(null);
     setLiveEncoding({});
-  }, []);
+    navigate("/login", { replace: true });
+  }, [navigate]);
 
   const handlePlayVideo = useCallback((v: Video) => {
-    setActiveVideo(v);
-    setPage("player");
-  }, []);
-
-  const handleBackFromPlayer = useCallback(() => {
-    setPage("library");
-    setActiveVideo(null);
-  }, []);
+    navigate(`/watch/${v.id}`);
+  }, [navigate]);
 
   // Waiting for token check to complete before rendering
   if (!authChecked) {
     return (
-      <div className="min-h-screen flex items-center justify-center" style={{ background: "#080b14" }}>
-        <Loader2 size={22} className="animate-spin text-blue-500" />
+      <div className="min-h-screen flex items-center justify-center" style={{ background: "var(--sv-bg)" }}>
+        <Loader2 size={22} className="animate-spin text-[var(--sv-accent)]" />
       </div>
     );
   }
 
-  if (!user) {
-    return <AuthPage onLogin={handleLogin} />;
-  }
-
   return (
-    <div className="flex h-screen overflow-hidden" style={{ background: "#080b14", fontFamily: "'Inter', sans-serif" }}>
-      <Sidebar page={page} setPage={setPage} collapsed={collapsed} setCollapsed={setCollapsed} user={user} onLogout={handleLogout} />
-      <div className="flex-1 flex flex-col overflow-hidden min-w-0">
-        <TopBar online={online} user={user} />
-        <main className="flex-1 overflow-y-auto p-6"
-          style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}>
-          <AnimatePresence mode="wait">
-            <motion.div key={page} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -6 }} transition={{ duration: 0.18, ease: "easeOut" }}>
-              {page === "dashboard" && <DashboardPage setPage={setPage} online={online} />}
-              {page === "upload"    && <UploadPage online={online} liveEvents={liveEncoding} />}
-              {page === "library"   && <LibraryPage onPlayVideo={handlePlayVideo} online={online} user={user} />}
-              {page === "player"    && <PlayerPage video={activeVideo} onBack={handleBackFromPlayer} />}
-              {page === "encoding"  && <EncodingPage liveEvents={liveEncoding} online={online} />}
-              {page === "storage"   && <StoragePage online={online} />}
-              {page === "settings"  && <SettingsPage user={user} />}
-              {page === "admin"     && <AdminPage online={online} />}
-            </motion.div>
-          </AnimatePresence>
-        </main>
-      </div>
-    </div>
+    <Routes>
+      <Route path="/login" element={user ? <Navigate to="/" replace /> : <AuthPage onLogin={handleLogin} />} />
+
+      {/* One shell for every authenticated route: the navbar always renders,
+          and the sidebar joins it too when the signed-in user is an admin —
+          on Home/Live/Library/Settings as well as /admin/*, not just there.
+          Redirects to /login when there's no session. */}
+      <Route element={<AppShell user={user} online={online} collapsed={collapsed} setCollapsed={setCollapsed} onLogout={handleLogout} />}>
+        <Route index element={<HomePage user={user} />} />
+        <Route path="live" element={<LiveTvPage />} />
+        <Route path="library" element={<LibraryPage onPlayVideo={handlePlayVideo} online={online} user={user} />} />
+        <Route path="settings" element={<SettingsPage user={user} />} />
+
+        {/* RequireAdmin is the real client-side boundary (server enforces it too) */}
+        <Route path="admin" element={<RequireAdmin user={user}><AdminPage online={online} /></RequireAdmin>} />
+        <Route path="admin/dashboard" element={<RequireAdmin user={user}><DashboardPage online={online} /></RequireAdmin>} />
+        {/* Ingest lives inside the admin subtree: /upload no longer exists, so a
+            non-admin typing either URL falls through to RequireAdmin → /library. */}
+        <Route path="admin/upload" element={<RequireAdmin user={user}><UploadPage online={online} liveEvents={liveEncoding} /></RequireAdmin>} />
+        <Route path="admin/encoding" element={<RequireAdmin user={user}><EncodingPage liveEvents={liveEncoding} online={online} /></RequireAdmin>} />
+        <Route path="admin/storage" element={<RequireAdmin user={user}><StoragePage online={online} /></RequireAdmin>} />
+        <Route path="admin/live" element={<RequireAdmin user={user}><LiveChannelsAdminPage /></RequireAdmin>} />
+      </Route>
+
+      {/* Full-bleed cinematic players. Deliberately rendered *outside* both
+          shells: they are `position: fixed` surfaces and every shell wraps its
+          <Outlet/> in a page-transition motion.div, whose transform becomes the
+          containing block for fixed descendants and would offset them.
+          RequireAuth applies the same "session required" rule the shells do. */}
+      <Route element={<RequireAuth user={user} />}>
+        <Route path="watch/live/:slug" element={<LiveChannelPlayerPage />} />
+        <Route path="watch/:videoId" element={<PlayerPage user={user} />} />
+      </Route>
+
+      <Route path="*" element={<Navigate to="/" replace />} />
+    </Routes>
   );
 }

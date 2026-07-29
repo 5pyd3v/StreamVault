@@ -17,9 +17,12 @@ import uploadRoutes from './routes/upload.js';
 import encodingRoutes from './routes/encoding.js';
 import storageRoutes from './routes/storage.js';
 import adminRoutes from './routes/admin.js';
+import liveRoutes from './routes/live.js';
 import { registerSocketHandlers } from './socket/handlers.js';
 import Video from './models/Video.js';
+import LiveChannel from './models/LiveChannel.js';
 import { startEncodingPipeline } from './services/encoder.js';
+import { startLiveMediaServer } from './services/liveMediaServer.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -27,7 +30,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STORAGE_BASE = process.env.STORAGE_LOCAL_PATH
   ? path.resolve(process.env.STORAGE_LOCAL_PATH)
   : path.join(__dirname, '..', 'uploads');
-['', 'temp', 'videos', 'thumbnails', 'hls']
+['', 'temp', 'videos', 'thumbnails', 'hls', 'recordings', 'hls/live', 'posters']
   .forEach(sub => fs.mkdirSync(path.join(STORAGE_BASE, sub), { recursive: true }));
 
 // Also keep temp dir separate if UPLOAD_TEMP_PATH is set
@@ -74,6 +77,7 @@ app.use('/api/upload',   uploadRoutes);
 app.use('/api/encoding', encodingRoutes);
 app.use('/api/storage',  storageRoutes);
 app.use('/api/admin',    adminRoutes);
+app.use('/api/live',     liveRoutes);
 
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
@@ -90,6 +94,23 @@ const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/streamvaul
 mongoose.connect(MONGO_URI).then(async () => {
   console.log('✅ MongoDB connected');
   httpServer.listen(PORT, () => console.log(`🚀 StreamVault API → http://localhost:${PORT}`));
+
+  // RTMP ingest for OBS (transcoding + HLS output handled by our own ffmpeg pipeline)
+  try {
+    startLiveMediaServer(io);
+  } catch (e: any) {
+    console.error('❌ Live media server failed to start:', e.message);
+  }
+
+  // No broadcast can survive a restart — clear stale live state
+  try {
+    await LiveChannel.updateMany(
+      { status: { $in: ['live', 'starting'] } },
+      { status: 'offline', currentSessionId: null, liveHlsPath: '', viewerCount: 0 }
+    );
+  } catch (e: any) {
+    console.error('Live channel reset error:', e.message);
+  }
 
   // Resume any videos stuck in processing/encoding from a previous crashed run
   try {

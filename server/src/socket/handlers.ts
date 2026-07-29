@@ -40,6 +40,15 @@ export function registerSocketHandlers(io: Server): void {
     socket.on('unwatch:video', (videoId: string) => {
       socket.leave(`video:${videoId}`);
     });
+
+    // Client can request a specific live channel room to receive live events
+    socket.on('watch:channel', (channelId: string) => {
+      socket.join(`channel:${channelId}`);
+    });
+
+    socket.on('unwatch:channel', (channelId: string) => {
+      socket.leave(`channel:${channelId}`);
+    });
   });
 }
 
@@ -73,4 +82,36 @@ export function emitEncodingError(io: Server, videoId: string, ownerId: string, 
   io.to(`video:${videoId}`).emit('encoding:error', event);
   io.to(`user:${ownerId}`).emit('encoding:error', event);
   io.to('admin').emit('encoding:error', event);
+}
+
+// ── Live channel events (called from the live media server / live encoder) ────
+// Strip the secret stream key before anything leaves the process.
+function publicChannel(channel: any): any {
+  const obj = channel?.toObject ? channel.toObject() : { ...channel };
+  delete obj.streamKey;
+  return obj;
+}
+
+// Emit a channel going live (broadcast globally so browse pages react without subscribing)
+export function emitChannelLive(io: Server, channel: any): void {
+  const safe = publicChannel(channel);
+  const channelId = String(safe._id);
+  const event = { channelId, channel: safe, ts: new Date().toISOString() };
+  io.to(`channel:${channelId}`).emit('live:started', event);
+  io.to('admin').emit('live:started', event);
+  io.emit('live:started', event);
+}
+
+export function emitChannelOffline(io: Server, channelId: string): void {
+  const event = { channelId, ts: new Date().toISOString() };
+  io.to(`channel:${channelId}`).emit('live:ended', event);
+  io.to('admin').emit('live:ended', event);
+  io.emit('live:ended', event);
+}
+
+export function emitChannelError(io: Server, channelId: string, error: string): void {
+  const event = { channelId, error, ts: new Date().toISOString() };
+  io.to(`channel:${channelId}`).emit('live:error', event);
+  io.to('admin').emit('live:error', event);
+  io.emit('live:error', event);
 }

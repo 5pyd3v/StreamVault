@@ -3,6 +3,7 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import Video from '../models/Video.js';
+import type { IVideoStream } from '../models/Video.js';
 import { io } from '../index.js';
 import { emitEncodingProgress, emitEncodingDone, emitEncodingError } from '../socket/handlers.js';
 
@@ -40,6 +41,59 @@ function releaseSlot(): void {
   activeJobs--;
   const next = jobQueue.shift();
   if (next) next();
+}
+
+// How many renditions of a SINGLE video may be worked on at the same time.
+// Worst case parallel ffmpeg processes = MAX_CONCURRENT_JOBS * RENDITION_CONCURRENCY.
+const RENDITION_CONCURRENCY = Math.max(1, Number(process.env.ENCODE_PARALLEL_RENDITIONS) || 2);
+
+/**
+ * Run `worker` over `items` with at most `limit` in flight at once.
+ * On the first failure no further items are started; already in-flight items are
+ * awaited (so no ffmpeg process is orphaned) and the first error is re-thrown.
+ */
+async function mapWithConcurrency<T>(
+  items: T[],
+  limit: number,
+  worker: (item: T, index: number) => Promise<void>
+): Promise<void> {
+  const total = items.length;
+  if (total === 0) return;
+
+  let nextIndex = 0;
+  let firstError: any = null;
+  const poolSize = Math.max(1, Math.min(limit, total));
+
+  const runner = async (): Promise<void> => {
+    while (true) {
+      if (firstError) return;
+      const index = nextIndex++;
+      if (index >= total) return;
+      try {
+        await worker(items[index], index);
+      } catch (err) {
+        if (!firstError) firstError = err;
+        return;
+      }
+    }
+  };
+
+  await Promise.all(Array.from({ length: poolSize }, () => runner()));
+  if (firstError) throw firstError;
+}
+
+/**
+ * Tiny async mutex: serializes the critical sections that mutate + save the
+ * shared Mongoose document, so concurrent renditions can't lose each other's
+ * updates. Never call a locked function from inside another locked section.
+ */
+function createMutex(): <T>(fn: () => Promise<T>) => Promise<T> {
+  let tail: Promise<unknown> = Promise.resolve();
+  return <T>(fn: () => Promise<T>): Promise<T> => {
+    const result = tail.then(fn, fn);
+    tail = result.catch(() => undefined);
+    return result;
+  };
 }
 
 // Quality presets - only encode up to source resolution
@@ -156,7 +210,8 @@ async function encodeRendition(
 async function generateHLS(
   inputPath: string,
   hlsDir: string,
-  qualityName: string
+  qualityName: string,
+  onProgress?: (pct: number) => void
 ): Promise<string> {
   const segDir = path.join(hlsDir, qualityName);
   fs.mkdirSync(segDir, { recursive: true });
@@ -179,6 +234,7 @@ async function generateHLS(
       ])
       .output(playlistPath)
       .on('stderr', line => { stderr += line + '\n'; })
+      .on('progress', p => { if (onProgress) onProgress(p.percent || 0); })
       .on('end', () => {
         // Verify segments were actually produced
         try {
@@ -233,13 +289,25 @@ export async function startEncodingPipeline(
     fs.mkdirSync(hlsDir, { recursive: true });
     fs.mkdirSync(thumbDir, { recursive: true });
 
+    // Serializes every mutation+save of the shared `video` document. Renditions run
+    // concurrently below, so `video.streams.push(...)`/`video.save()` must not interleave.
+    const withVideoLock = createMutex();
+
+    // Progress must never go backwards for the frontend, even though several
+    // renditions report their own percentages concurrently.
+    let lastEmittedProgress = 0;
+
     const updateStage = async (stage: string, progress: number, detail?: string) => {
-      log(videoId, `${stage} ${progress}%`);
-      video.encodingStage = stage;
-      video.encodingProgress = progress;
-      video.encodingLog.push(`[${new Date().toISOString()}] ${stage} (${progress}%)`);
-      await video.save();
-      emitEncodingProgress(io, videoId, ownerId, { stage, progress, detail });
+      const clamped = Math.max(lastEmittedProgress, progress);
+      lastEmittedProgress = clamped;
+      log(videoId, `${stage} ${clamped}%`);
+      await withVideoLock(async () => {
+        video.encodingStage = stage;
+        video.encodingProgress = clamped;
+        video.encodingLog.push(`[${new Date().toISOString()}] ${stage} (${clamped}%)`);
+        await video.save();
+      });
+      emitEncodingProgress(io, videoId, ownerId, { stage, progress: clamped, detail });
     };
 
     // Stage 1: FFprobe - analyze source video
@@ -279,47 +347,134 @@ export async function startEncodingPipeline(
     }
     await updateStage('Thumbnails generated', 20);
 
-    // Stage 3: Encode each quality (only up to source resolution)
+    // Stage 3 + 4: encode each quality (only up to source resolution) and HLS-segment it.
+    // Renditions run concurrently (bounded by RENDITION_CONCURRENCY) and each one's HLS
+    // segmentation starts as soon as *that* rendition's encode finishes, rather than
+    // waiting for every encode to complete first.
     const encodedPaths: Record<string, string> = {};
+    const streamResults: Record<string, IVideoStream> = {};
     const baseProgress = 20;
-    const encProgressRange = 55;
+    const encProgressRange = 55;  // 20% -> 75%
+    const hlsProgressRange = 18;  // 75% -> 93%
     const sourceHeight = video.height || 1080;
     const applicableQualities = QUALITIES.filter(q => parseInt(q.name) <= sourceHeight * 1.1);
-    const perQuality = encProgressRange / applicableQualities.length;
+    const qualityCount = Math.max(1, applicableQualities.length);
+    const perQualityEncode = encProgressRange / qualityCount;
+    const perQualityHls = hlsProgressRange / qualityCount;
 
-    for (let qi = 0; qi < applicableQualities.length; qi++) {
-      const q = applicableQualities[qi];
-      await updateStage(`Encoding ${q.name}`, Math.round(baseProgress + qi * perQuality));
-      const outPath = await encodeRendition(inputPath, hlsDir, q, (pct) => {
-        const stageProgress = Math.round(baseProgress + qi * perQuality + (pct / 100) * perQuality);
-        emitEncodingProgress(io, videoId, ownerId, {
-          stage: `Encoding ${q.name}`,
-          progress: stageProgress,
-          detail: `${pct.toFixed(1)}%`,
+    // Per-rendition completion, aggregated into one overall percentage.
+    const encodePct: Record<string, number> = {};
+    const hlsPct: Record<string, number> = {};
+    const activePhase: Record<string, 'encode' | 'hls'> = {};
+    for (const q of applicableQualities) { encodePct[q.name] = 0; hlsPct[q.name] = 0; }
+
+    const computeProgress = (): number => {
+      let p = baseProgress;
+      for (const q of applicableQualities) {
+        p += (encodePct[q.name] / 100) * perQualityEncode;
+        p += (hlsPct[q.name] / 100) * perQualityHls;
+      }
+      return Math.min(baseProgress + encProgressRange + hlsProgressRange, Math.round(p));
+    };
+
+    const describeStage = (): string => {
+      const encoding = applicableQualities.filter(q => activePhase[q.name] === 'encode').map(q => q.name);
+      const segmenting = applicableQualities.filter(q => activePhase[q.name] === 'hls').map(q => q.name);
+      const parts: string[] = [];
+      if (encoding.length) parts.push(`Encoding ${encoding.join(', ')}`);
+      if (segmenting.length) parts.push(`HLS segmentation ${segmenting.join(', ')}`);
+      return parts.length ? parts.join(' | ') : 'Encoding renditions';
+    };
+
+    const describeDetail = (): string => {
+      const inFlight = applicableQualities
+        .filter(q => activePhase[q.name])
+        .map(q => {
+          const pct = activePhase[q.name] === 'encode' ? encodePct[q.name] : hlsPct[q.name];
+          return `${q.name} ${pct.toFixed(1)}%`;
         });
+      const done = applicableQualities.filter(q => hlsPct[q.name] >= 100).length;
+      const summary = `${done}/${applicableQualities.length} renditions ready`;
+      return inFlight.length ? `${inFlight.join(' · ')} · ${summary}` : summary;
+    };
+
+    // Lightweight, throttled tick: emits only, never touches the DB.
+    let lastTickAt = 0;
+    let lastTickProgress = -1;
+    const emitAggregate = (force = false): void => {
+      const progress = Math.max(lastEmittedProgress, computeProgress());
+      const now = Date.now();
+      if (!force && progress === lastTickProgress && now - lastTickAt < 1000) return;
+      lastTickAt = now;
+      lastTickProgress = progress;
+      lastEmittedProgress = progress;
+      emitEncodingProgress(io, videoId, ownerId, {
+        stage: describeStage(),
+        progress,
+        detail: describeDetail(),
       });
+    };
+
+    if (applicableQualities.length > 0) {
+      await updateStage(
+        `Encoding ${applicableQualities.map(q => q.name).join(', ')}`,
+        baseProgress,
+        `${applicableQualities.length} renditions, up to ${RENDITION_CONCURRENCY} in parallel`
+      );
+    }
+
+    const runRendition = async (q: typeof QUALITIES[0]): Promise<void> => {
+      // --- encode ---
+      activePhase[q.name] = 'encode';
+      emitAggregate(true);
+      const outPath = await encodeRendition(inputPath, hlsDir, q, (pct) => {
+        const clean = Math.min(100, Math.max(0, pct));
+        if (clean > encodePct[q.name]) encodePct[q.name] = clean;
+        emitAggregate();
+      });
+      encodePct[q.name] = 100;
       encodedPaths[q.name] = outPath;
 
-      // Save stream info to video document
+      // --- record the stream (serialized: concurrent saves would clobber each other) ---
       const stats = fs.statSync(outPath);
-      video.streams.push({
+      const stream: IVideoStream = {
         quality: q.name as any,
         bitrate: parseInt(q.bitrate),
         path: outPath,
         size: stats.size,
         status: 'done',
+      };
+      streamResults[q.name] = stream;
+      await withVideoLock(async () => {
+        video.streams.push(stream);
+        await video.save();
       });
-      await video.save();
-    }
-    await updateStage('Encoding complete', 75);
 
-    // Stage 4: HLS segmentation for each quality
-    const encodedQualities = Object.keys(encodedPaths);
-    for (let qi = 0; qi < encodedQualities.length; qi++) {
-      const qName = encodedQualities[qi];
-      await updateStage(`HLS segmentation ${qName}`, Math.round(75 + (qi / encodedQualities.length) * 18));
-      await generateHLS(encodedPaths[qName], hlsDir, qName);
+      // --- segment this rendition immediately, without waiting for the others ---
+      activePhase[q.name] = 'hls';
+      await updateStage(`Encoded ${q.name}`, computeProgress(), describeDetail());
+      await generateHLS(outPath, hlsDir, q.name, (pct) => {
+        const clean = Math.min(100, Math.max(0, pct));
+        if (clean > hlsPct[q.name]) hlsPct[q.name] = clean;
+        emitAggregate();
+      });
+      hlsPct[q.name] = 100;
+      delete activePhase[q.name];
+      await updateStage(`HLS segmentation ${q.name} complete`, computeProgress(), describeDetail());
+    };
+
+    await mapWithConcurrency(applicableQualities, RENDITION_CONCURRENCY, runRendition);
+
+    // Renditions finish out of order, so normalize `streams` back to ascending quality
+    // order (same contents/order the old sequential loop produced) in one final write.
+    const encodedQualities = applicableQualities.map(q => q.name).filter(name => encodedPaths[name]);
+    if (encodedQualities.length > 0) {
+      await withVideoLock(async () => {
+        video.set('streams', encodedQualities.map(name => streamResults[name]));
+        await video.save();
+      });
     }
+    await updateStage('Encoding complete', baseProgress + encProgressRange + hlsProgressRange);
 
     // Stage 5: Master playlist
     await updateStage('Generating master playlist', 94);

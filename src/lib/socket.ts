@@ -21,6 +21,39 @@ export interface EncodingErrorEvent {
   ts: string;
 }
 
+/**
+ * `live:started` carries the raw LiveChannel document (minus the stream key),
+ * *not* the `publicShape` the REST endpoints return — so it has `posterPath`
+ * rather than `posterUrl` and never carries `hlsUrl`. Consumers should treat
+ * `channel` as advisory and derive the playlist URL from `channelId`
+ * (see `liveHlsUrlFor` in lib/api).
+ */
+export interface LiveStartedEvent {
+  channelId: string;
+  channel?: {
+    _id?: string;
+    name?: string;
+    slug?: string;
+    description?: string;
+    category?: string;
+    status?: string;
+    liveStartedAt?: string;
+    [key: string]: unknown;
+  };
+  ts: string;
+}
+
+export interface LiveEndedEvent {
+  channelId: string;
+  ts: string;
+}
+
+export interface LiveErrorEvent {
+  channelId: string;
+  error: string;
+  ts: string;
+}
+
 let _socket: Socket | null = null;
 
 export function getSocket(): Socket {
@@ -52,4 +85,14 @@ export function watchVideo(videoId: string): void {
 
 export function unwatchVideo(videoId: string): void {
   getSocket().emit("unwatch:video", videoId);
+}
+
+// ── Live channel rooms (mirror of the watch:video pattern above) ──────────────
+
+export function watchChannel(channelId: string): void {
+  getSocket().emit("watch:channel", channelId);
+}
+
+export function unwatchChannel(channelId: string): void {
+  getSocket().emit("unwatch:channel", channelId);
 }

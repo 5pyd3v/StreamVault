@@ -78,7 +78,63 @@
   --sidebar-ring: oklch(0.439 0 0);
 }
 
+/* ── StreamVault surface tokens ──────────────────────────────────────────────
+   A Netflix-style palette: near-black canvas, neutral dark-grey surfaces, and
+   one signature red used flatly and sparingly on CTAs, active states, focus
+   rings and badges. There is deliberately no blue / indigo / violet anywhere
+   in the brand ramp — the chrome is monochrome and red is the only hue that
+   carries meaning.
+
+   They are declared on `:root` *and* `.dark` on purpose: the app is dark-only
+   and never puts the `.dark` class on <html>, so a `.dark`-only declaration
+   would not resolve today. Keeping both means the tokens stay correct if a
+   real light/dark toggle is added later.
+
+   Call sites reference them as `bg-[var(--sv-bg)]` or
+   `style={{ background: "var(--sv-accent)" }}`. The pre-mixed alpha variants
+   (`-soft`, `-faint`, `-border`) exist so no call site has to apply a Tailwind
+   opacity modifier to an arbitrary `var()` colour. */
+:root,
+.dark {
+  --sv-bg: #141414;              /* app canvas — Netflix's browse background */
+  --sv-bg-deep: #000000;         /* full-bleed player surface / deepest scrim */
+  --sv-surface: #181818;         /* sidebar / raised panels */
+  --sv-surface-2: #1f1f1f;       /* popovers, tooltips, nested panels */
+  --sv-border: rgba(255, 255, 255, 0.08);
+  --sv-border-strong: rgba(255, 255, 255, 0.16);
+  --sv-accent: #e50914;          /* Netflix red — flat, not a gradient */
+  --sv-accent-hover: #f6121d;    /* brighter red for hover / pulse states */
+  --sv-accent-from: #e50914;     /* kept for the handful of gradient call     */
+  --sv-accent-to: #b20710;       /* sites — same hue, just a darker stop      */
+  --sv-accent-soft: rgba(229, 9, 20, 0.16);   /* tinted fills */
+  --sv-accent-faint: rgba(229, 9, 20, 0.08);  /* very light tinted fills */
+  --sv-accent-border: rgba(229, 9, 20, 0.45); /* focus rings / active borders */
+  --sv-accent-text: #ff4d55;     /* red that stays legible at body text size */
+  --sv-live-red: #e50914;        /* pulsing LIVE badge — same red as the brand */
+  --sv-text: #ffffff;
+  --sv-text-muted: rgba(255, 255, 255, 0.62);
+  --sv-text-dim: rgba(255, 255, 255, 0.38);
+}
+
 @theme inline {
+  --color-sv-bg: var(--sv-bg);
+  --color-sv-bg-deep: var(--sv-bg-deep);
+  --color-sv-surface: var(--sv-surface);
+  --color-sv-surface-2: var(--sv-surface-2);
+  --color-sv-border: var(--sv-border);
+  --color-sv-border-strong: var(--sv-border-strong);
+  --color-sv-accent: var(--sv-accent);
+  --color-sv-accent-hover: var(--sv-accent-hover);
+  --color-sv-accent-from: var(--sv-accent-from);
+  --color-sv-accent-to: var(--sv-accent-to);
+  --color-sv-accent-soft: var(--sv-accent-soft);
+  --color-sv-accent-faint: var(--sv-accent-faint);
+  --color-sv-accent-border: var(--sv-accent-border);
+  --color-sv-accent-text: var(--sv-accent-text);
+  --color-sv-live: var(--sv-live-red);
+  --color-sv-text: var(--sv-text);
+  --color-sv-text-muted: var(--sv-text-muted);
+  --color-sv-text-dim: var(--sv-text-dim);
   --color-background: var(--background);
   --color-foreground: var(--foreground);
   --color-card: var(--card);
@@ -124,8 +180,19 @@
     @apply border-border outline-ring/50;
   }
 
+  /* The app is dark-only. Painting the document itself with the brand canvas
+     stops the white `--background` from the legacy shadcn scaffold flashing
+     through before/behind the React tree (and behind scroll-bounce). */
+  html,
   body {
-    @apply bg-background text-foreground;
+    background-color: var(--sv-bg);
+    color: var(--sv-text);
+  }
+
+  /* Netflix's chrome is monochrome, so the browser UI should match. */
+  ::selection {
+    background: var(--sv-accent);
+    color: #fff;
   }
 
   /**
