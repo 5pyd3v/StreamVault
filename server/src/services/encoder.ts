@@ -179,12 +179,18 @@ async function spawnEncodeAttempt(
   const { waitForExit } = spawnWithStallWatchdog(FFMPEG_BIN, args, {
     label: `encoder (${backend})`,
     stallTimeoutMs: STALL_TIMEOUT_MS,
-    onStderrData: (text) => {
-      // ffmpeg prints one "time=HH:MM:SS.xx" progress line periodically,
-      // reflecting the shared decode timeline all output branches ride on --
-      // one combined percentage is correct instead of N independently
-      // tracked ones, since every rendition finishes together.
-      const m = text.match(/time=(\d+):(\d+):(\d+\.\d+)/);
+    // `-progress pipe:1` (in buildEncodeArgs) emits periodic `out_time=
+    // HH:MM:SS.ffffff` blocks on stdout -- this is what actually drives the
+    // percentage now. The human-readable "time=" line on stderr this used to
+    // parse is silently empty for the entire encode under `-loglevel warning`
+    // (confirmed directly: zero stderr data events over a real multi-second
+    // encode), which is why progress used to sit frozen at its starting value
+    // and jump straight to 100% once the process closed.
+    onStdoutData: (text) => {
+      // One combined percentage is correct (not N independently tracked ones)
+      // since every rendition rides the same shared decode timeline and
+      // finishes together.
+      const m = text.match(/out_time=(\d+):(\d+):(\d+\.\d+)/);
       if (m && opts.videoDurationSec > 0) {
         const seconds = Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]);
         opts.onProgress(Math.min(100, (seconds / opts.videoDurationSec) * 100));

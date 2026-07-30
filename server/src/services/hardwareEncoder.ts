@@ -1,4 +1,5 @@
 import { spawn, ChildProcess } from 'child_process';
+import os from 'os';
 
 // ── Shared hardware-encoder detection + spawn utilities ────────────────────────
 //
@@ -98,7 +99,12 @@ export function videoCodecArgsFor(backend: EncoderBackend, rate: RateControl, st
     default:
       return [
         `-c:${v}`, 'libx264',
-        `-preset:${v}`, process.env.ENCODER_SOFTWARE_PRESET || 'superfast',
+        `-preset:${v}`, process.env.ENCODER_SOFTWARE_PRESET || 'ultrafast',
+        // ffmpeg's own thread auto-detection is a documented weak spot inside
+        // VMs/containers, where core-count detection from /proc can be wrong
+        // or overly conservative -- pin explicitly to what Node itself sees
+        // so software encoding actually uses every available core.
+        `-threads:${v}`, String(os.cpus().length),
         `-crf:${v}`, '23', `-b:${v}`, rate.bitrate, `-maxrate:${v}`, maxrate, `-bufsize:${v}`, bufsize,
       ];
   }
@@ -107,10 +113,20 @@ export function videoCodecArgsFor(backend: EncoderBackend, rate: RateControl, st
 export interface StallWatchdogOptions {
   /** Prefix for log lines, e.g. "encoder (nvenc)" or "live:42". */
   label: string;
-  /** Kill + reject if ffmpeg produces zero stderr output for this long. */
+  /** Kill + reject if ffmpeg produces zero output for this long. */
   stallTimeoutMs: number;
   checkIntervalMs?: number;
   onStderrData?: (text: string) => void;
+  /**
+   * Fires with `-progress pipe:1`'s machine-readable `key=value` blocks
+   * (present on every command this module builds args for) -- the only
+   * reliable channel for live progress/stats. ffmpeg's human-readable stats
+   * line on stderr can go completely silent for the entire duration of a real
+   * encode under `-loglevel warning` (confirmed directly: a 46s encode
+   * produced zero stderr `data` events), so progress percentage / fps / speed
+   * must be parsed from here, not from stderr.
+   */
+  onStdoutData?: (text: string) => void;
 }
 
 export interface StallWatchdogResult {
@@ -187,9 +203,11 @@ export function spawnWithStallWatchdog(
       // fine (observed in production: a healthy software-encoded live stream
       // got killed as "stalled" after ~35s of stderr silence). Any data here
       // is a reliable liveness signal regardless of whether stderr happens to
-      // have anything to say.
-      proc.stdout?.on('data', () => {
+      // have anything to say, and it's also the only reliable source of live
+      // progress/fps/speed (see onStdoutData's doc comment).
+      proc.stdout?.on('data', (chunk: Buffer) => {
         lastActivityAt = Date.now();
+        opts.onStdoutData?.(chunk.toString());
       });
 
       proc.on('error', (err: Error) => {

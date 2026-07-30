@@ -297,8 +297,17 @@ export async function startLiveTranscode(
     }
   };
 
-  const parseLiveStderr = (backend: EncoderBackend) => (text: string) => {
+  // stderr under `-loglevel warning` is for real warnings/errors only -- it
+  // can go completely silent for an entire healthy broadcast (confirmed
+  // directly this session), so fps/speed stats are NOT parsed from here.
+  const logLiveStderr = (text: string) => {
     console.log(`[live:${channelId}] ${text.trim()}`);
+  };
+
+  // `-progress pipe:1` (in buildLiveArgs) emits periodic `key=value` blocks on
+  // stdout, including fps=/speed= -- the only reliable source for these
+  // stats, unlike stderr above.
+  const parseLiveStdout = (backend: EncoderBackend) => (text: string) => {
     const fpsMatch = text.match(/fps=\s*([\d.]+)/);
     const speedMatch = text.match(/speed=\s*([\d.]+)x/);
     if (fpsMatch || speedMatch) {
@@ -323,7 +332,8 @@ export async function startLiveTranscode(
     const { proc, waitForExit } = spawnWithStallWatchdog(FFMPEG_BIN, args, {
       label: `live:${channelId} (${backend})`,
       stallTimeoutMs: LIVE_STALL_TIMEOUT_MS,
-      onStderrData: parseLiveStderr(backend),
+      onStderrData: logLiveStderr,
+      onStdoutData: parseLiveStdout(backend),
     });
     applyPriority(proc);
     liveStats.set(channelId, { backend, pid: proc.pid, startedAt: Date.now() });

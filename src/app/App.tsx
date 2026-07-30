@@ -493,10 +493,26 @@ function DashboardPage({ online }: { online: boolean | null }) {
 }
 
 // ─── Upload Center ────────────────────────────────────────────────────────────
-function UploadPage({ online, liveEvents }: { online: boolean | null; liveEvents: Record<string, EncodingProgressEvent> }) {
-  const [dragging, setDragging] = useState(false);
+// The queue (state + in-flight fetch/abort/resume bookkeeping) lives in this
+// hook, called once from the top-level App() and passed down as props --
+// mirroring how `liveEncoding` already works. UploadPage itself is only
+// mounted while the route is /admin/upload; without this, navigating to any
+// other page unmounts it and destroys the queue view (the underlying
+// uploadFileChunked() fetch calls keep running regardless, since they're not
+// tied to component lifecycle, but there was no way to see or reconnect to
+// them). Lifting the state to App() -- which never unmounts across route
+// changes -- means the queue simply keeps existing in memory and reappears
+// exactly as it was whenever UploadPage remounts.
+interface UploadQueueApi {
+  uploads: UploadItem[];
+  handleFiles: (files: FileList | null) => void;
+  togglePause: (id: string) => void;
+  resumeUpload: (id: string) => void;
+  cancel: (id: string) => void;
+}
+
+function useUploadQueue(online: boolean | null, liveEvents: Record<string, EncodingProgressEvent>): UploadQueueApi {
   const [uploads, setUploads] = useState<UploadItem[]>([]);
-  const fileRef = useRef<HTMLInputElement>(null);
   const abortRefs = useRef<Map<string, AbortController>>(new Map());
   // Track file references and upload state for resume
   const fileRefs = useRef<Map<string, { file: File; uploadId: string; lastChunk: number }>>(new Map());
@@ -653,6 +669,18 @@ function UploadPage({ online, liveEvents }: { online: boolean | null; liveEvents
     abortRefs.current.delete(id);
     setUploads(u => u.filter(i => i.id !== id));
   };
+
+  return { uploads, handleFiles, togglePause, resumeUpload, cancel };
+}
+
+function UploadPage({
+  online, liveEvents, uploads, handleFiles, togglePause, resumeUpload, cancel,
+}: {
+  online: boolean | null;
+  liveEvents: Record<string, EncodingProgressEvent>;
+} & UploadQueueApi) {
+  const [dragging, setDragging] = useState(false);
+  const fileRef = useRef<HTMLInputElement>(null);
 
   return (
     <div className="space-y-6">
@@ -2442,6 +2470,9 @@ export default function App() {
   const [collapsed, setCollapsed] = useState(false);
   const [liveEncoding, setLiveEncoding] = useState<Record<string, EncodingProgressEvent>>({});
   const [online, setOnline] = useState<boolean | null>(null);
+  // Lives here (not inside UploadPage) so the queue survives navigating away
+  // from /admin/upload and back -- see useUploadQueue's doc comment.
+  const uploadQueue = useUploadQueue(online, liveEncoding);
 
   // Restore session from stored token on mount (only if a token exists)
   useEffect(() => {
@@ -2526,7 +2557,7 @@ export default function App() {
         <Route path="admin/dashboard" element={<RequireAdmin user={user}><DashboardPage online={online} /></RequireAdmin>} />
         {/* Ingest lives inside the admin subtree: /upload no longer exists, so a
             non-admin typing either URL falls through to RequireAdmin → /library. */}
-        <Route path="admin/upload" element={<RequireAdmin user={user}><UploadPage online={online} liveEvents={liveEncoding} /></RequireAdmin>} />
+        <Route path="admin/upload" element={<RequireAdmin user={user}><UploadPage online={online} liveEvents={liveEncoding} {...uploadQueue} /></RequireAdmin>} />
         <Route path="admin/encoding" element={<RequireAdmin user={user}><EncodingPage liveEvents={liveEncoding} online={online} /></RequireAdmin>} />
         <Route path="admin/storage" element={<RequireAdmin user={user}><StoragePage online={online} /></RequireAdmin>} />
         <Route path="admin/live" element={<RequireAdmin user={user}><LiveChannelsAdminPage /></RequireAdmin>} />
