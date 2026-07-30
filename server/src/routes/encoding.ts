@@ -3,7 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { pool } from '../db/pool.js';
-import { findVideoById, updateVideo, type VideoRow } from '../db/videos.js';
+import { findVideoById, updateVideo, parseJsonColumn, type VideoRow } from '../db/videos.js';
 import { listVideoStreams, deleteVideoStreams } from '../db/videoStreams.js';
 import { protect, requireAdmin, AuthRequest } from '../middleware/auth.js';
 import { startEncodingPipeline, generateThumbnailOptions } from '../services/encoder.js';
@@ -77,7 +77,7 @@ router.get('/jobs/:id', protect, requireAdmin, async (req: AuthRequest, res) => 
       title: video.title,
       encodingProgress: video.encoding_progress,
       encodingStage: video.encoding_stage,
-      encodingLog: video.encoding_log ? JSON.parse(video.encoding_log) : [],
+      encodingLog: parseJsonColumn(video.encoding_log, [] as string[]),
       encodingError: video.encoding_error ?? undefined,
       status: video.status,
       streams: streams.map(s => ({

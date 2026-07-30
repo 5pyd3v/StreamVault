@@ -2,6 +2,30 @@ import type { RowDataPacket, ResultSetHeader } from 'mysql2';
 import { pool } from './pool.js';
 import { listVideoStreams, type VideoStreamRow } from './videoStreams.js';
 
+/**
+ * mysql2 auto-parses native MySQL `JSON` columns into real JS values (arrays/
+ * objects) before this code ever sees them -- it does NOT hand back a raw
+ * string to `JSON.parse` yourself, despite what the column's TS type here
+ * implies. `JSON.parse(anArray)` coerces its argument to a string first
+ * (`String([])` === `''`), and `JSON.parse('')` throws "Unexpected end of
+ * JSON input" -- which silently flipped every finished encode with an empty
+ * `tags`/`encoding_log` array to `status: 'failed'` (the error was caught by
+ * `startEncodingPipeline`'s catch block right after real success) and 500'd
+ * `GET /api/videos` for any account with such a video in the list. Handles
+ * both the already-parsed value (the actual mysql2 behavior) and a raw
+ * string (in case of a different driver config) defensively.
+ */
+export function parseJsonColumn<T>(value: unknown, fallback: T): T {
+  if (value === null || value === undefined) return fallback;
+  if (typeof value !== 'string') return value as T;
+  if (value === '') return fallback;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+}
+
 export type VideoStatus = 'uploading' | 'processing' | 'encoding' | 'published' | 'failed' | 'draft' | 'archived';
 export type SourceType = 'upload' | 'live-recording';
 
@@ -65,10 +89,10 @@ export function toApiVideo(row: VideoRow, streams: VideoStreamRow[] = []) {
     thumbnailPath: row.thumbnail_path,
     previewPath: row.preview_path,
     streams: streams.map(s => ({ quality: s.quality, bitrate: s.bitrate, path: s.path, size: Number(s.size), status: s.status })),
-    tags: row.tags ? JSON.parse(row.tags) : [],
+    tags: parseJsonColumn(row.tags, [] as string[]),
     folder: row.folder,
     views: Number(row.views),
-    encodingLog: row.encoding_log ? JSON.parse(row.encoding_log) : [],
+    encodingLog: parseJsonColumn(row.encoding_log, [] as string[]),
     sourceType: row.source_type,
     sourceChannel: row.source_channel_id ? String(row.source_channel_id) : undefined,
     encodingJobId: row.encoding_job_id ?? undefined,
