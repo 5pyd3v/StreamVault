@@ -503,7 +503,16 @@ function UploadPage({ online, liveEvents }: { online: boolean | null; liveEvents
 
   const startUpload = async (file: File) => {
     if (!online) return;
-    const id = crypto.randomUUID();
+    // crypto.randomUUID() only works in a "secure context" (HTTPS or
+    // localhost) -- unavailable over plain http:// on a public IP/domain,
+    // which is a completely normal way to reach this app before a TLS
+    // certificate is set up. This id is only ever a local React/map key for
+    // the upload queue UI (the real server-side upload id comes back from
+    // /api/upload/init as `p.uploadId` below), so it doesn't need
+    // cryptographic randomness -- any locally-unique string works.
+    const id = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
     const chunkSize = 5 * 1024 * 1024;
     const chunks = Math.ceil(file.size / chunkSize);
     const ctrl = new AbortController();
