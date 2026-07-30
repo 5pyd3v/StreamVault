@@ -195,6 +195,34 @@ export const liveAdminApi = {
 /** Stable per-channel live playlist URL (mirrors the server's `publicShape`). */
 export const liveHlsUrlFor = (channelId: string) => `/uploads/hls/live/${channelId}/master.m3u8`;
 
+/**
+ * Copies text to the clipboard. `navigator.clipboard` only exists in a
+ * "secure context" (HTTPS or localhost) -- unavailable over plain http:// on
+ * a public IP/domain (e.g. before a TLS certificate is set up), which would
+ * otherwise throw for every "copy stream key"/"copy link" button (callers
+ * already catch that and show an error, but this makes copy actually work
+ * instead of just failing gracefully). Falls back to the older
+ * `document.execCommand('copy')` path, which has no such restriction.
+ * Throws on failure, matching `navigator.clipboard.writeText`'s own contract,
+ * so existing `try { await ... } catch { showError() }` call sites work
+ * unchanged.
+ */
+export async function copyToClipboard(text: string): Promise<void> {
+  if (typeof navigator !== 'undefined' && navigator.clipboard) {
+    return navigator.clipboard.writeText(text);
+  }
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.style.position = 'fixed';
+  textarea.style.opacity = '0';
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+  const ok = document.execCommand('copy');
+  document.body.removeChild(textarea);
+  if (!ok) throw new Error('Copy command failed');
+}
+
 // ── Upload API + chunker ──────────────────────────────────────────────────────
 const CHUNK_SIZE = 5 * 1024 * 1024; // 5 MB
 
@@ -242,10 +270,20 @@ export async function uploadFileChunked(
       const end = Math.min(start + CHUNK_SIZE, file.size);
       const chunk = file.slice(start, end);
 
-      // Compute SHA-256 hash
+      // Compute SHA-256 hash for chunk integrity verification. crypto.subtle is
+      // only available in a "secure context" (HTTPS or localhost) -- over
+      // plain http:// on a public IP/domain (e.g. before a TLS certificate is
+      // set up) it's undefined, which would otherwise throw here before the
+      // chunk is ever sent. The server already treats the hash as optional
+      // (server/src/routes/upload.ts only verifies it `if (hash)`), so this
+      // degrades to "upload without integrity verification" instead of
+      // failing the upload outright.
       const buffer = await chunk.arrayBuffer();
-      const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
-      const hash = Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+      let hash = '';
+      if (typeof crypto !== 'undefined' && crypto.subtle) {
+        const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
+        hash = Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+      }
 
       const formData = new FormData();
       formData.append('chunk', new Blob([buffer], { type: 'application/octet-stream' }), 'chunk');

@@ -13,7 +13,7 @@ import LiveChannelPlayerPage from "./pages/LiveChannelPlayerPage";
 import LiveChannelsAdminPage from "./pages/LiveChannelsAdminPage";
 import { connectSocket, disconnectSocket, getSocket, watchVideo } from "../lib/socket";
 import type { EncodingProgressEvent } from "../lib/socket";
-import { authApi, encodingApi, checkHealth, uploadFileChunked } from "../lib/api";
+import { authApi, encodingApi, checkHealth, uploadFileChunked, copyToClipboard } from "../lib/api";
 import type { ApiVideo, AuthUser } from "../lib/api";
 import { motion, AnimatePresence } from "motion/react";
 import {
@@ -1205,7 +1205,7 @@ function PlayerPage({ user }: { user: AuthUser | null } = { user: null }) {
   const handleShare = async () => {
     const url = `${window.location.origin}/watch/${v.id}`;
     try {
-      await navigator.clipboard.writeText(url);
+      await copyToClipboard(url);
       showMsg("Share link copied", true);
     } catch { showMsg("Could not copy link", false); }
   };
@@ -1214,7 +1214,7 @@ function PlayerPage({ user }: { user: AuthUser | null } = { user: null }) {
     if (!v.hlsUrl) { showMsg("Video not ready for embed", false); return; }
     const embed = `<video controls><source src="${window.location.origin}${v.hlsUrl}" type="application/x-mpegURL"></video>`;
     try {
-      await navigator.clipboard.writeText(embed);
+      await copyToClipboard(embed);
       showMsg("Embed code copied", true);
     } catch { showMsg("Could not copy embed", false); }
   };

@@ -3,7 +3,7 @@ import {
   AlertCircle, Check, Copy, Eye, EyeOff, Image as ImageIcon, Key, Loader2, Plus,
   RefreshCw, Signal, Square, Trash2,
 } from "lucide-react";
-import { liveAdminApi } from "../../lib/api";
+import { liveAdminApi, copyToClipboard } from "../../lib/api";
 import type { ApiLiveChannelAdmin } from "../../lib/api";
 import { getSocket } from "../../lib/socket";
 import type { LiveEndedEvent, LiveErrorEvent, LiveStartedEvent } from "../../lib/socket";
@@ -32,7 +32,7 @@ function CopyField({ label, value }: { label: string; value: string }) {
   const [copied, setCopied] = useState(false);
   const copy = async () => {
     try {
-      await navigator.clipboard.writeText(value);
+      await copyToClipboard(value);
       setCopied(true);
       setTimeout(() => setCopied(false), 1600);
     } catch { /* clipboard blocked — the value is selectable in the field */ }
