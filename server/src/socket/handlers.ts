@@ -2,6 +2,19 @@ import { Server, Socket } from 'socket.io';
 import jwt from 'jsonwebtoken';
 import { findUserById, toPublicUser } from '../db/users.js';
 
+/** In-memory viewer counts, keyed by channel id. Not persisted per-join/leave to avoid extra DB write pressure on every viewer action. */
+const viewerCounts = new Map<string, number>();
+
+export function getViewerCount(channelId: string): number {
+  return viewerCounts.get(channelId) || 0;
+}
+
+function adjustViewerCount(channelId: string, delta: number): void {
+  const next = Math.max(0, (viewerCounts.get(channelId) || 0) + delta);
+  if (next === 0) viewerCounts.delete(channelId);
+  else viewerCounts.set(channelId, next);
+}
+
 export function registerSocketHandlers(io: Server): void {
   // Authenticate socket connections
   io.use(async (socket: Socket, next) => {
@@ -30,8 +43,14 @@ export function registerSocketHandlers(io: Server): void {
     // Admins join the admin room for global events
     if (user.role === 'admin') socket.join('admin');
 
+    // Channels this socket is currently counted as watching -- lets disconnect
+    // (no explicit unwatch:channel) still decrement the viewer count.
+    const watchedChannels = new Set<string>();
+
     socket.on('disconnect', () => {
       console.log(`[Socket] Disconnected: ${user.email}`);
+      for (const channelId of watchedChannels) adjustViewerCount(channelId, -1);
+      watchedChannels.clear();
     });
 
     // Client can request specific video room to receive encoding events
@@ -46,10 +65,15 @@ export function registerSocketHandlers(io: Server): void {
     // Client can request a specific live channel room to receive live events
     socket.on('watch:channel', (channelId: string) => {
       socket.join(`channel:${channelId}`);
+      if (!watchedChannels.has(channelId)) {
+        watchedChannels.add(channelId);
+        adjustViewerCount(channelId, 1);
+      }
     });
 
     socket.on('unwatch:channel', (channelId: string) => {
       socket.leave(`channel:${channelId}`);
+      if (watchedChannels.delete(channelId)) adjustViewerCount(channelId, -1);
     });
   });
 }

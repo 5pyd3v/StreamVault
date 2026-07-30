@@ -1,5 +1,6 @@
 import { Server } from 'socket.io';
 import { ChildProcess } from 'child_process';
+import fs from 'fs';
 import { v4 as uuidv4 } from 'uuid';
 import NodeMediaServer from 'node-media-server';
 import {
@@ -8,7 +9,7 @@ import {
   setChannelOffline,
   setChannelError,
 } from '../db/liveChannels.js';
-import { startLiveTranscode, captureChannelPosterIfMissing } from './liveEncoder.js';
+import { startLiveTranscode, captureChannelPosterIfMissing, recordingPathFor } from './liveEncoder.js';
 import { handleRecordingFinished } from './liveRecording.js';
 import { emitChannelLive, emitChannelOffline, emitChannelError } from '../socket/handlers.js';
 
@@ -16,11 +17,21 @@ import { emitChannelLive, emitChannelOffline, emitChannelError } from '../socket
 const transcoders = new Map<string, ChildProcess>();
 /** Active RTMP ingest session ids (node-media-server internal ids), keyed by channel id. */
 const rtmpSessions = new Map<string, string>();
+/** Current broadcast session id (the uuid used for recording/transcode file paths), keyed by channel id. */
+const channelSessions = new Map<string, string>();
+/** Pending offline/finalize teardown timers from donePublish, keyed by channel id -- cancelled if the same channel republishes within the grace window. */
+const pendingTeardowns = new Map<string, { timer: NodeJS.Timeout; sessionId: string }>();
+/** Session ids whose recording should be discarded (a reconnect made them stale) instead of finalized into a VOD. */
+const discardedSessions = new Set<string>();
+/** Channels currently being force-stopped by an admin -- skips the reconnect grace window so the UI reflects offline immediately. */
+const forceStopping = new Set<string>();
 
 let nms: NodeMediaServer | null = null;
 
 /** Grace period for ffmpeg to flush the recording after the publisher disconnects. */
 const FLUSH_TIMEOUT_MS = 15000;
+/** How long to wait for the same stream key to republish before treating a disconnect as a real end-of-broadcast. */
+const RECONNECT_GRACE_MS = Number(process.env.LIVE_RECONNECT_GRACE_MS) || 10000;
 
 function log(message: string): void {
   console.log(`[live-rtmp] ${message}`);
@@ -94,7 +105,21 @@ export function startLiveMediaServer(io: Server): NodeMediaServer {
         if (!channel) return rejectSession(id, 'unknown stream key');
 
         channelId = String(channel.id);
+
+        // Reconnect within the grace window: cancel the pending offline
+        // transition and discard the stale (partial) recording instead of
+        // publishing it as a replay -- viewers never saw an "ended" event for
+        // this blip, so there's nothing worth finalizing.
+        const pending = pendingTeardowns.get(channelId);
+        if (pending) {
+          clearTimeout(pending.timer);
+          pendingTeardowns.delete(channelId);
+          discardedSessions.add(pending.sessionId);
+          log(`${channel.slug} reconnected within grace window — discarding stale session ${pending.sessionId}`);
+        }
+
         const sessionId = uuidv4();
+        channelSessions.set(channelId, sessionId);
 
         await setChannelLive(channel.id, sessionId);
 
@@ -105,18 +130,33 @@ export function startLiveMediaServer(io: Server): NodeMediaServer {
         const { stream_key: _streamKey, ...safeChannel } = channel;
         emitChannelLive(io, safeChannel);
 
-        const proc = startLiveTranscode(channel, sessionId);
+        let latestProc: ChildProcess;
+        const proc = await startLiveTranscode(channel, sessionId, {
+          onProcessReplaced: (newProc) => {
+            latestProc = newProc;
+            if (transcoders.has(channelId)) transcoders.set(channelId, newProc);
+          },
+          onExit: () => {
+            if (transcoders.get(channelId) === latestProc) transcoders.delete(channelId);
+            if (discardedSessions.delete(sessionId)) {
+              const staleRecording = recordingPathFor(channelId, sessionId);
+              try {
+                if (fs.existsSync(staleRecording)) fs.unlinkSync(staleRecording);
+              } catch (e: any) {
+                console.error(`[live-rtmp] Failed to discard stale recording ${staleRecording}: ${e.message}`);
+              }
+            } else {
+              void handleRecordingFinished(channelId, sessionId);
+            }
+          },
+        });
+        latestProc = proc;
         transcoders.set(channelId, proc);
 
         // Channels without a poster get one grabbed off their own HLS output as
         // soon as the first segment lands. Fire-and-forget by design — it must
         // never delay or fail the live-start flow.
         captureChannelPosterIfMissing(channelId);
-
-        proc.on('close', () => {
-          if (transcoders.get(channelId) === proc) transcoders.delete(channelId);
-          void handleRecordingFinished(channelId, sessionId);
-        });
       } catch (err: any) {
         console.error(`[live-rtmp] postPublish failed: ${err.message}`);
         if (channelId) {
@@ -129,6 +169,11 @@ export function startLiveMediaServer(io: Server): NodeMediaServer {
   });
 
   // ── donePublish: publisher disconnected ───────────────────────────────────
+  // Doesn't immediately flip the channel offline -- a brief OBS/network blip
+  // shouldn't flash "stream ended" to every viewer or publish a few seconds of
+  // replay. The channel only actually goes offline (and its recording gets
+  // finalized) if nothing republishes with the same stream key within the
+  // grace window; see postPublish's `pendingTeardowns` handling above.
   server.on('donePublish', (id, streamPath) => {
     void (async () => {
       const { streamKey } = parseStreamPath(streamPath);
@@ -137,11 +182,29 @@ export function startLiveMediaServer(io: Server): NodeMediaServer {
         if (!channel) return;
 
         const channelId = String(channel.id);
-        await setChannelOffline(channel.id);
-
+        const sessionId = channelSessions.get(channelId);
         rtmpSessions.delete(channelId);
-        log(`⚫ ${channel.slug} went offline (session ${id})`);
-        emitChannelOffline(io, channelId);
+
+        const goOffline = async () => {
+          if (channelSessions.get(channelId) === sessionId) channelSessions.delete(channelId);
+          await setChannelOffline(channel.id).catch(() => { /* best effort */ });
+          log(`⚫ ${channel.slug} went offline (session ${id})`);
+          emitChannelOffline(io, channelId);
+        };
+
+        if (forceStopping.delete(channelId)) {
+          // Admin-initiated stop: reflect offline immediately, no grace window.
+          pendingTeardowns.delete(channelId);
+          await goOffline();
+        } else {
+          log(`${channel.slug} publisher disconnected (session ${id}) — waiting ${RECONNECT_GRACE_MS}ms for reconnect`);
+          const timer = setTimeout(() => {
+            pendingTeardowns.delete(channelId);
+            void goOffline();
+          }, RECONNECT_GRACE_MS);
+          timer.unref?.();
+          if (sessionId) pendingTeardowns.set(channelId, { sessionId, timer });
+        }
 
         // ffmpeg normally exits on its own once the loopback pull hits EOF, which
         // is what flushes the recording cleanly. Only force it if it hangs around.
@@ -172,6 +235,7 @@ export function startLiveMediaServer(io: Server): NodeMediaServer {
  */
 export function stopChannelStream(channelId: string): boolean {
   let stopped = false;
+  forceStopping.add(channelId); // donePublish skips the reconnect grace window for this channel
 
   const sessionId = rtmpSessions.get(channelId);
   if (sessionId) {
@@ -202,4 +266,9 @@ export function stopChannelStream(channelId: string): boolean {
 /** True when a transcode process is currently running for this channel. */
 export function isChannelStreaming(channelId: string): boolean {
   return transcoders.has(channelId);
+}
+
+/** Channel ids with an active transcode process right now (for the admin diagnostics endpoint). */
+export function listActiveChannelIds(): string[] {
+  return Array.from(transcoders.keys());
 }

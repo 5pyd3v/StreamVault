@@ -1,5 +1,4 @@
 import ffmpeg from 'fluent-ffmpeg';
-import { spawn, ChildProcess } from 'child_process';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
@@ -9,6 +8,8 @@ import {
   findVideoById, updateVideo, appendEncodingLog, markVideoFailed, getApiVideo,
 } from '../db/videos.js';
 import { addVideoStream } from '../db/videoStreams.js';
+import { type EncoderBackend, resolveEncoderBackend, videoCodecArgsFor, spawnWithStallWatchdog } from './hardwareEncoder.js';
+import { acquireVodSlot, releaseVodSlot, releaseHardwareSlot } from './resourceScheduler.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -25,31 +26,6 @@ const FFMPEG_BIN = process.env.FFMPEG_PATH || 'ffmpeg';
 
 if (process.env.FFMPEG_PATH) ffmpeg.setFfmpegPath(process.env.FFMPEG_PATH);
 if (process.env.FFPROBE_PATH) ffmpeg.setFfprobePath(process.env.FFPROBE_PATH);
-
-// How many different *videos* may encode at once, server-wide. This is now
-// the only concurrency knob that matters: since a single video's renditions
-// all encode in one ffmpeg process (see below), the old per-rendition
-// concurrency limiter has nothing left to bound.
-const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT_JOBS) || 4;
-let activeJobs = 0;
-const jobQueue: Array<() => void> = [];
-
-function acquireSlot(): Promise<void> {
-  return new Promise(resolve => {
-    if (activeJobs < MAX_CONCURRENT) {
-      activeJobs++;
-      resolve();
-    } else {
-      jobQueue.push(() => { activeJobs++; resolve(); });
-    }
-  });
-}
-
-function releaseSlot(): void {
-  activeJobs--;
-  const next = jobQueue.shift();
-  if (next) next();
-}
 
 // Quality presets - only encode up to source resolution
 const QUALITIES = [
@@ -130,46 +106,9 @@ async function generateThumbnails(
 // starts, almost certainly the dominant cost behind multi-hour encode times.
 // This redesign mirrors the single-process multi-output architecture already
 // proven in services/liveEncoder.ts: one input, one decode, N encode branches
-// via `-filter_complex split`, each branch its own `-map`/output. Hardware
-// encoding (NVENC preferred, QSV/AMF as alternates) is attempted first when
-// available, with automatic fallback to software libx264 if the hardware path
-// fails to come up (wrong GPU vendor / missing driver in production vs. here).
-
-type EncoderBackend = 'nvenc' | 'qsv' | 'amf' | 'software';
-
-let cachedEncoderCaps: Set<string> | null = null;
-
-/** Probes the ffmpeg *binary* (not the runtime GPU) once, cached for the process lifetime. */
-async function probeAvailableEncoders(): Promise<Set<string>> {
-  if (cachedEncoderCaps) return cachedEncoderCaps;
-  return new Promise(resolve => {
-    let out = '';
-    const proc = spawn(FFMPEG_BIN, ['-hide_banner', '-encoders'], { windowsHide: true });
-    proc.stdout?.on('data', (d: Buffer) => { out += d.toString(); });
-    proc.on('close', () => {
-      const caps = new Set<string>();
-      for (const enc of ['h264_nvenc', 'h264_qsv', 'h264_amf']) if (out.includes(enc)) caps.add(enc);
-      cachedEncoderCaps = caps;
-      resolve(caps);
-    });
-    proc.on('error', () => { cachedEncoderCaps = new Set(); resolve(cachedEncoderCaps); });
-  });
-}
-
-async function resolveEncoderBackend(): Promise<EncoderBackend> {
-  const configured = (process.env.ENCODER_HWACCEL || 'auto').toLowerCase();
-  if (configured === 'software' || configured === 'none') return 'software';
-  if (configured === 'nvenc' || configured === 'qsv' || configured === 'amf') return configured;
-  const caps = await probeAvailableEncoders();
-  if (caps.has('h264_nvenc')) return 'nvenc';
-  if (caps.has('h264_qsv')) return 'qsv';
-  if (caps.has('h264_amf')) return 'amf';
-  return 'software';
-}
-
-function parseKbps(bitrateStr: string): number {
-  return parseInt(bitrateStr, 10) || 0;
-}
+// via `-filter_complex split`, each branch its own `-map`/output. Backend
+// detection, per-backend codec args, and the stall watchdog now live in
+// hardwareEncoder.ts, shared with liveEncoder.ts.
 
 function buildEncodeArgs(
   inputPath: string,
@@ -177,12 +116,17 @@ function buildEncodeArgs(
   qualities: typeof QUALITIES,
   backend: EncoderBackend
 ): string[] {
-  const args: string[] = ['-hide_banner', '-loglevel', 'warning', '-y'];
-  // Hardware decode is only wired up for the NVENC/CUDA path -- QSV/AMF hwaccel
-  // decode flags vary too much by platform/driver to safely auto-enable, and
-  // encode-side hardware acceleration alone (still used for those backends
-  // below) already captures most of the win.
-  if (backend === 'nvenc') args.push('-hwaccel', 'cuda');
+  // `-progress pipe:1` gives the stall watchdog a reliable, immediately-
+  // flushed heartbeat on stdout, independent of whatever the human-readable
+  // stats line on stderr happens to be doing (see hardwareEncoder.ts).
+  const args: string[] = ['-hide_banner', '-loglevel', 'warning', '-y', '-progress', 'pipe:1'];
+  // Deliberately software decode even when the *encoder* is hardware (NVENC/QSV/
+  // AMF/VideoToolbox). `-hwaccel cuda` (GPU decode) was tried initially and
+  // caused real production hangs -- likely a CUDA-context/driver
+  // initialization stall that never errors out, just sits at 0% CPU forever.
+  // Hardware *encode* is the well-understood, reliable win (most of the
+  // speedup); hardware *decode* adds a much less portable failure mode for
+  // comparatively little extra gain, so it's not used anywhere in this app.
   args.push('-i', inputPath);
 
   const splitOutputs = qualities.map((_, k) => `[s${k}]`).join('');
@@ -195,30 +139,8 @@ function buildEncodeArgs(
 
   for (let i = 0; i < qualities.length; i++) {
     const q = qualities[i];
-    const kbps = parseKbps(q.bitrate);
-    const maxrate = `${Math.round(kbps * 1.1)}k`;
-    const bufsize = `${Math.round(kbps * 2)}k`;
-
     args.push('-map', `[v${i}]`, '-map', '0:a:0?');
-
-    if (backend === 'nvenc') {
-      args.push(
-        '-c:v', 'h264_nvenc',
-        '-preset', process.env.ENCODER_NVENC_PRESET || 'p4',
-        '-rc', 'vbr', '-b:v', q.bitrate, '-maxrate', maxrate, '-bufsize', bufsize,
-      );
-    } else if (backend === 'qsv') {
-      args.push('-c:v', 'h264_qsv', '-preset', 'veryfast', '-b:v', q.bitrate, '-maxrate', maxrate);
-    } else if (backend === 'amf') {
-      args.push('-c:v', 'h264_amf', '-quality', 'speed', '-b:v', q.bitrate, '-maxrate', maxrate);
-    } else {
-      args.push(
-        '-c:v', 'libx264',
-        '-preset', process.env.ENCODER_SOFTWARE_PRESET || 'superfast',
-        '-crf', '23', '-b:v', q.bitrate,
-      );
-    }
-
+    args.push(...videoCodecArgsFor(backend, { bitrate: q.bitrate }));
     args.push(
       '-c:a', 'aac', '-b:a', q.audioBitrate,
       '-pix_fmt', 'yuv420p', '-movflags', '+faststart',
@@ -234,65 +156,67 @@ interface EncodeAllOptions {
   onProgress: (pct: number) => void;
 }
 
-/** Spawns one multi-output ffmpeg process, returns once every output file exists and is non-empty. */
-function spawnEncodeAttempt(
+// If ffmpeg produces *zero* output (not even its own startup banner/stream-info
+// lines, let alone a "time=" progress update) for this long, treat it as hung
+// and kill it rather than waiting forever -- this is what actually happened in
+// production with `-hwaccel cuda`: a silent CUDA-context stall at 0% CPU that
+// never errored out and never timed out on its own. Any real ffmpeg process
+// (hardware or software) prints substantial stderr within the first second or
+// two, so this is a generous margin, not a tight race.
+const STALL_TIMEOUT_MS = Number(process.env.ENCODER_STALL_TIMEOUT_MS) || 30_000;
+
+/** Spawns one multi-output ffmpeg process, resolves once every output file exists and is non-empty. */
+async function spawnEncodeAttempt(
   inputPath: string,
   outputPaths: Record<string, string>,
   qualities: typeof QUALITIES,
   backend: EncoderBackend,
   opts: EncodeAllOptions
 ): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const args = buildEncodeArgs(inputPath, outputPaths, qualities, backend);
-    const proc = spawn(FFMPEG_BIN, args, { windowsHide: true });
-    const startedAt = Date.now();
-    let stderrTail = '';
+  const args = buildEncodeArgs(inputPath, outputPaths, qualities, backend);
+  console.log(`[encoder] spawning: ${FFMPEG_BIN} ${args.join(' ')}`);
 
-    proc.stderr?.on('data', (chunk: Buffer) => {
-      const text = chunk.toString();
-      stderrTail = (stderrTail + text).slice(-2000);
+  const { waitForExit } = spawnWithStallWatchdog(FFMPEG_BIN, args, {
+    label: `encoder (${backend})`,
+    stallTimeoutMs: STALL_TIMEOUT_MS,
+    onStderrData: (text) => {
       // ffmpeg prints one "time=HH:MM:SS.xx" progress line periodically,
       // reflecting the shared decode timeline all output branches ride on --
-      // one combined percentage is now correct instead of N independently
+      // one combined percentage is correct instead of N independently
       // tracked ones, since every rendition finishes together.
       const m = text.match(/time=(\d+):(\d+):(\d+\.\d+)/);
       if (m && opts.videoDurationSec > 0) {
         const seconds = Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]);
         opts.onProgress(Math.min(100, (seconds / opts.videoDurationSec) * 100));
       }
-    });
-
-    proc.on('error', (err: Error) => {
-      reject(new Error(`ffmpeg (${backend}) spawn failed: ${err.message}`));
-    });
-
-    proc.on('close', (code, signal) => {
-      const elapsed = Date.now() - startedAt;
-      const allProduced = qualities.every(q => {
-        const p = outputPaths[q.name];
-        return fs.existsSync(p) && fs.statSync(p).size > 0;
-      });
-      if (code === 0 && allProduced) {
-        resolve();
-        return;
-      }
-      // A near-instant non-zero exit (or a zero exit with no real output)
-      // means the hardware path never actually came up -- the caller retries
-      // with software instead of failing the whole job.
-      reject(new Error(
-        `ffmpeg (${backend}) exited code=${code} signal=${signal} after ${Math.round(elapsed / 1000)}s ` +
-        `(allOutputsProduced=${allProduced}). Stderr: ${stderrTail.slice(-500)}`
-      ));
-    });
+    },
   });
+
+  const { code, signal, stderrTail, elapsedMs } = await waitForExit;
+  const allProduced = qualities.every(q => {
+    const p = outputPaths[q.name];
+    return fs.existsSync(p) && fs.statSync(p).size > 0;
+  });
+  if (code === 0 && allProduced) return;
+  // A near-instant non-zero exit (or a zero exit with no real output) means
+  // the hardware path never actually came up -- the caller retries with
+  // software instead of failing the whole job.
+  throw new Error(
+    `ffmpeg (${backend}) exited code=${code} signal=${signal} after ${Math.round(elapsedMs / 1000)}s ` +
+    `(allOutputsProduced=${allProduced}). Stderr: ${stderrTail.slice(-500)}`
+  );
 }
 
 /**
  * Encodes every applicable quality rendition in ONE ffmpeg process (one
- * decode, N encode branches). Tries the resolved hardware backend first; on
- * any failure, automatically retries once with software libx264 so a
- * hardware/driver mismatch degrades to "slow but working" instead of failing
- * the job outright.
+ * decode, N encode branches). Tries the resolved hardware backend first
+ * (only if `preferHardware` -- the resource scheduler may have denied this
+ * job a hardware slot because live broadcasts are already using it, in which
+ * case it goes straight to software); on any hardware failure, automatically
+ * retries once with software libx264 so a hardware/driver mismatch degrades
+ * to "slow but working" instead of failing the job outright. `onFallbackToSoftware`
+ * lets the caller give back its reserved hardware slot the moment it's no
+ * longer needed, instead of holding it for the rest of the job.
  */
 async function encodeAllRenditions(
   videoId: string,
@@ -300,12 +224,14 @@ async function encodeAllRenditions(
   outputDir: string,
   qualities: typeof QUALITIES,
   videoDurationSec: number,
-  onProgress: (pct: number) => void
+  onProgress: (pct: number) => void,
+  preferHardware: boolean,
+  onFallbackToSoftware: () => void
 ): Promise<Record<string, string>> {
   const outputPaths: Record<string, string> = {};
   for (const q of qualities) outputPaths[q.name] = path.join(outputDir, `${q.name}.mp4`);
 
-  const backend = await resolveEncoderBackend();
+  const backend = preferHardware ? await resolveEncoderBackend() : 'software';
   try {
     log(videoId, `encoding ${qualities.map(q => q.name).join('+')} via ${backend} (single pass)`);
     await spawnEncodeAttempt(inputPath, outputPaths, qualities, backend, { videoDurationSec, onProgress });
@@ -313,6 +239,7 @@ async function encodeAllRenditions(
   } catch (err: any) {
     if (backend === 'software') throw err; // already the fallback -- nothing left to try
     log(videoId, `⚠️  hardware encode (${backend}) failed, falling back to software: ${err.message}`);
+    onFallbackToSoftware();
     await spawnEncodeAttempt(inputPath, outputPaths, qualities, 'software', { videoDurationSec, onProgress });
     return outputPaths;
   }
@@ -427,7 +354,8 @@ export async function startEncodingPipeline(
   inputPath: string,
   ownerId: string
 ): Promise<void> {
-  await acquireSlot();
+  const { useHardware } = await acquireVodSlot();
+  let holdingHwSlot = useHardware;
   try {
     const video = await findVideoById(videoId);
     if (!video) throw new Error('Video not found');
@@ -517,7 +445,9 @@ export async function startEncodingPipeline(
         `Encoding ${applicableQualities.map(q => q.name).join(', ')}`,
         baseProgress + (pct / 100) * encProgressRange,
         `${pct.toFixed(1)}%`,
-      )
+      ),
+      holdingHwSlot,
+      () => { if (holdingHwSlot) { holdingHwSlot = false; releaseHardwareSlot(); } }
     );
     await updateStage('Encoding complete', baseProgress + encProgressRange);
 
@@ -567,7 +497,7 @@ export async function startEncodingPipeline(
     await markVideoFailed(videoId, err.message);
     emitEncodingError(io, videoId, ownerId, err.message);
   } finally {
-    releaseSlot();
+    releaseVodSlot(holdingHwSlot);
   }
 }
 

@@ -1,10 +1,13 @@
 import { spawn, ChildProcess } from 'child_process';
+import os from 'os';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { findChannelById, setChannelError, claimChannelPosterIfEmpty, type LiveChannelRow } from '../db/liveChannels.js';
 import { io } from '../index.js';
 import { emitChannelError } from '../socket/handlers.js';
+import { type EncoderBackend, resolveEncoderBackend, videoCodecArgsFor, spawnWithStallWatchdog } from './hardwareEncoder.js';
+import { registerLiveSession, unregisterLiveSession, reserveHardwareSlot, releaseHardwareSlot } from './resourceScheduler.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -109,23 +112,44 @@ async function markChannelError(channelId: string, message: string): Promise<voi
   emitChannelError(io, channelId, message);
 }
 
-/**
- * Spawn the single ffmpeg process that re-pulls the just-published RTMP stream
- * over loopback and fans it out into (a) a fragmented-MP4 recording tee and
- * (b) a multi-variant live HLS ladder under uploads/hls/live/{channelId}.
- */
-export function startLiveTranscode(channel: LiveChannelRow, sessionId: string): ChildProcess {
-  const channelId = String(channel.id);
-  const renditions = resolveRenditions();
-  const segTime = Number(process.env.LIVE_HLS_SEGMENT_TIME) || 4;
-  // DVR window: how far back a viewer can seek before segments roll off and
-  // get deleted from disk. Too small (the old hardcoded 6 segments / ~24s)
-  // means any backward seek almost immediately targets an already-deleted
-  // segment, which forces hls.js to snap back to the live edge -- that's the
-  // "rewind doesn't work" bug. list_size is derived from a seconds budget so
-  // it stays correct regardless of segment duration.
-  const dvrSeconds = Number(process.env.LIVE_HLS_DVR_SECONDS) || 180;
-  const listSize = Math.max(6, Math.ceil(dvrSeconds / segTime));
+/** How long a hardware live-encode attempt gets to prove it actually came up before falling back to software. */
+const LIVE_STALL_TIMEOUT_MS = Number(process.env.LIVE_STALL_TIMEOUT_MS) || 30_000;
+
+interface LiveTranscodeStats {
+  backend: EncoderBackend;
+  pid?: number;
+  startedAt: number;
+  lastFps?: number;
+  lastSpeed?: number;
+  lastProgressAt?: number;
+}
+
+/** Live encode stats for the admin diagnostics endpoint, keyed by channel id. */
+const liveStats = new Map<string, LiveTranscodeStats>();
+
+export function getLiveTranscodeStats(channelId: string): LiveTranscodeStats | undefined {
+  return liveStats.get(channelId);
+}
+
+export interface LiveTranscodeHandlers {
+  /** Called if the initial process is replaced by a software-fallback respawn, so the caller's process map stays accurate. */
+  onProcessReplaced: (proc: ChildProcess) => void;
+  /** Called once the (possibly-replaced) process has genuinely finished the broadcast. */
+  onExit: () => void;
+}
+
+/** Pure builder for the ffmpeg args -- the only thing that changes between a hardware attempt and its software fallback. */
+function buildLiveArgs(
+  channel: LiveChannelRow,
+  renditions: LiveRendition[],
+  backend: EncoderBackend,
+  segTime: number,
+  listSize: number,
+  recordingPath: string,
+  segmentPattern: string,
+  playlistPattern: string,
+  varStreamMap: string
+): string[] {
   const rtmpPort = Number(process.env.RTMP_PORT) || 1935;
   const rtmpApp = channel.rtmp_app || 'live';
   // `channel` here always comes from `findChannelByStreamKey`, which explicitly
@@ -133,29 +157,20 @@ export function startLiveTranscode(channel: LiveChannelRow, sessionId: string): 
   // even though the shared `LiveChannelRow` type marks it optional.
   const inputUrl = `rtmp://127.0.0.1:${rtmpPort}/${rtmpApp}/${channel.stream_key}`;
 
-  // Recording target — one file per broadcast session
-  const recordDir = storageDir('recordings', channelId);
-  fs.mkdirSync(recordDir, { recursive: true });
-  const recordingPath = recordingPathFor(channelId, sessionId);
-
-  // HLS target — fixed per-channel dir (stable URL), wiped per broadcast so
-  // stale segments from a previous run never linger.
-  const hlsDir = storageDir('hls', 'live', channelId);
-  fs.rmSync(hlsDir, { recursive: true, force: true });
-  fs.mkdirSync(hlsDir, { recursive: true });
-  for (const r of renditions) fs.mkdirSync(path.join(hlsDir, r.name), { recursive: true });
-
-  const segmentPattern = path.join(hlsDir, '%v', 'seg_%04d.ts').replace(/\\/g, '/');
-  const playlistPattern = path.join(hlsDir, '%v', 'index.m3u8').replace(/\\/g, '/');
-  const varStreamMap = renditions.map((r, i) => `v:${i},a:${i},name:${r.name}`).join(' ');
-
   // ── filter_complex: only the transcoded rungs go through the graph.
   // The 'source' rung is mapped straight off the input so it can use -c:v copy
   // (a filtered stream can never be stream-copied).
   const scaled = renditions.filter(r => r.name !== 'source');
+  // `-progress pipe:1` gives the stall watchdog a reliable, immediately-
+  // flushed heartbeat on stdout, independent of whatever the human-readable
+  // stats line on stderr happens to be doing (see hardwareEncoder.ts) -- a
+  // healthy, actively-encoding live stream was observed going quiet on
+  // stderr for 30s+ and getting killed as "stalled" without this.
   const args: string[] = [
     '-hide_banner',
     '-loglevel', 'warning',
+    '-y',
+    '-progress', 'pipe:1',
     '-fflags', '+genpts',
     '-i', inputUrl,
   ];
@@ -194,17 +209,14 @@ export function startLiveTranscode(channel: LiveChannelRow, sessionId: string): 
     if (r.name === 'source') {
       args.push(`-c:v:${i}`, 'copy');
     } else {
-      args.push(
-        `-c:v:${i}`, 'libx264',
-        `-preset:v:${i}`, 'veryfast',
-        `-profile:v:${i}`, 'main',
-        `-pix_fmt:v:${i}`, 'yuv420p',
-        `-b:v:${i}`, r.bitrate,
-        `-maxrate:v:${i}`, r.maxrate,
-        `-bufsize:v:${i}`, r.bufsize,
-        `-sc_threshold:v:${i}`, '0',
-        `-force_key_frames:v:${i}`, `expr:gte(t,n_forced*${segTime})`,
-      );
+      args.push(...videoCodecArgsFor(backend, { bitrate: r.bitrate, maxrate: r.maxrate, bufsize: r.bufsize }, i));
+      args.push(`-profile:v:${i}`, 'main', `-pix_fmt:v:${i}`, 'yuv420p');
+      // `sc_threshold` is a libx264-private AVOption -- hardware encoders don't
+      // recognize it (harmless "has not been used for any stream" warning, but
+      // still wrong to send). `force_key_frames` is a generic muxer-level option
+      // and applies to every backend.
+      if (backend === 'software') args.push(`-sc_threshold:v:${i}`, '0');
+      args.push(`-force_key_frames:v:${i}`, `expr:gte(t,n_forced*${segTime})`);
     }
   }
   args.push(
@@ -220,33 +232,145 @@ export function startLiveTranscode(channel: LiveChannelRow, sessionId: string): 
     playlistPattern,
   );
 
-  log(channelId, `ffmpeg ${renditions.map(r => r.name).join('+')} → ${hlsDir}`);
+  return args;
+}
 
-  const proc = spawn(FFMPEG_BIN, args, { windowsHide: true });
-  const startedAt = Date.now();
-  let stderrTail = '';
+/**
+ * Spawn the single ffmpeg process that re-pulls the just-published RTMP stream
+ * over loopback and fans it out into (a) a fragmented-MP4 recording tee and
+ * (b) a multi-variant live HLS ladder under uploads/hls/live/{channelId}.
+ *
+ * Tries the resolved hardware backend first; if it fails to actually come up
+ * within `LIVE_STALL_TIMEOUT_MS` (via the shared stall watchdog -- the exact
+ * mechanism that caught the `-hwaccel cuda` production hang for VOD), the
+ * *transcode process* is respawned on software libx264. The RTMP
+ * session/OBS connection itself is untouched throughout -- only the
+ * downstream ffmpeg swaps backend, via `handlers.onProcessReplaced`.
+ */
+export async function startLiveTranscode(
+  channel: LiveChannelRow,
+  sessionId: string,
+  handlers: LiveTranscodeHandlers
+): Promise<ChildProcess> {
+  const channelId = String(channel.id);
+  const renditions = resolveRenditions();
+  const segTime = Number(process.env.LIVE_HLS_SEGMENT_TIME) || 4;
+  // DVR window: how far back a viewer can seek before segments roll off and
+  // get deleted from disk. Too small (the old hardcoded 6 segments / ~24s)
+  // means any backward seek almost immediately targets an already-deleted
+  // segment, which forces hls.js to snap back to the live edge -- that's the
+  // "rewind doesn't work" bug. list_size is derived from a seconds budget so
+  // it stays correct regardless of segment duration.
+  const dvrSeconds = Number(process.env.LIVE_HLS_DVR_SECONDS) || 180;
+  const listSize = Math.max(6, Math.ceil(dvrSeconds / segTime));
 
-  proc.stderr?.on('data', (chunk: Buffer) => {
-    const text = chunk.toString();
-    stderrTail = (stderrTail + text).slice(-2000);
-    console.log(`[live:${channelId}] ${text.trim()}`);
-  });
+  // Recording target — one file per broadcast session
+  const recordDir = storageDir('recordings', channelId);
+  fs.mkdirSync(recordDir, { recursive: true });
+  const recordingPath = recordingPathFor(channelId, sessionId);
 
-  proc.on('error', (err: Error) => {
-    log(channelId, `❌ ffmpeg spawn error: ${err.message}`);
-    void markChannelError(channelId, `ffmpeg spawn failed: ${err.message}`);
-  });
+  // HLS target — fixed per-channel dir (stable URL), wiped per broadcast so
+  // stale segments from a previous run never linger.
+  const hlsDir = storageDir('hls', 'live', channelId);
+  fs.rmSync(hlsDir, { recursive: true, force: true });
+  fs.mkdirSync(hlsDir, { recursive: true });
+  for (const r of renditions) fs.mkdirSync(path.join(hlsDir, r.name), { recursive: true });
 
-  proc.on('close', (code, signal) => {
-    const elapsed = Date.now() - startedAt;
-    log(channelId, `ffmpeg exited (code=${code} signal=${signal}) after ${Math.round(elapsed / 1000)}s`);
-    // A near-instant non-zero exit means the pipeline never came up at all.
-    if (code !== 0 && signal === null && elapsed < 5000) {
-      void markChannelError(channelId, `Live transcode failed to start: ${stderrTail.slice(-500) || `exit code ${code}`}`);
+  const segmentPattern = path.join(hlsDir, '%v', 'seg_%04d.ts').replace(/\\/g, '/');
+  const playlistPattern = path.join(hlsDir, '%v', 'index.m3u8').replace(/\\/g, '/');
+  const varStreamMap = renditions.map((r, i) => `v:${i},a:${i},name:${r.name}`).join(' ');
+
+  // Live is never gated by the VOD resource scheduler, but it still needs to
+  // register so VOD admission knows to throttle itself against it.
+  registerLiveSession(channelId);
+  let unregistered = false;
+  const unregisterOnce = () => { if (!unregistered) { unregistered = true; unregisterLiveSession(channelId); } };
+
+  let holdingHwSlot = false;
+  const releaseHwSlotIfHeld = () => { if (holdingHwSlot) { holdingHwSlot = false; releaseHardwareSlot(); } };
+
+  const applyPriority = (proc: ChildProcess) => {
+    try {
+      if (proc.pid) os.setPriority(proc.pid, os.constants.priority.PRIORITY_ABOVE_NORMAL);
+    } catch (e: any) {
+      log(channelId, `could not raise ffmpeg process priority (non-fatal): ${e.message}`);
     }
-  });
+  };
 
-  return proc;
+  const parseLiveStderr = (backend: EncoderBackend) => (text: string) => {
+    console.log(`[live:${channelId}] ${text.trim()}`);
+    const fpsMatch = text.match(/fps=\s*([\d.]+)/);
+    const speedMatch = text.match(/speed=\s*([\d.]+)x/);
+    if (fpsMatch || speedMatch) {
+      const prev = liveStats.get(channelId);
+      liveStats.set(channelId, {
+        backend,
+        pid: prev?.pid,
+        startedAt: prev?.startedAt ?? Date.now(),
+        lastFps: fpsMatch ? Number(fpsMatch[1]) : prev?.lastFps,
+        lastSpeed: speedMatch ? Number(speedMatch[1]) : prev?.lastSpeed,
+        lastProgressAt: Date.now(),
+      });
+    }
+  };
+
+  /** One spawn attempt; recurses once into a software retry if a hardware attempt never comes up. */
+  const attempt = (backend: EncoderBackend): ChildProcess => {
+    if (backend !== 'software') holdingHwSlot = reserveHardwareSlot('live');
+    const args = buildLiveArgs(channel, renditions, backend, segTime, listSize, recordingPath, segmentPattern, playlistPattern, varStreamMap);
+    log(channelId, `ffmpeg (${backend}) ${renditions.map(r => r.name).join('+')} → ${hlsDir}`);
+
+    const { proc, waitForExit } = spawnWithStallWatchdog(FFMPEG_BIN, args, {
+      label: `live:${channelId} (${backend})`,
+      stallTimeoutMs: LIVE_STALL_TIMEOUT_MS,
+      onStderrData: parseLiveStderr(backend),
+    });
+    applyPriority(proc);
+    liveStats.set(channelId, { backend, pid: proc.pid, startedAt: Date.now() });
+
+    waitForExit.then(
+      ({ code, signal, stderrTail, elapsedMs }) => {
+        // A near-instant non-zero exit means the pipeline never came up at all.
+        const neverCameUp = code !== 0 && signal === null && elapsedMs < 5000;
+        if (neverCameUp && backend !== 'software') {
+          log(channelId, `⚠️  live encode (${backend}) failed to start, falling back to software: ${stderrTail.slice(-500) || `exit code ${code}`}`);
+          releaseHwSlotIfHeld();
+          const replacement = attempt('software');
+          handlers.onProcessReplaced(replacement);
+          return;
+        }
+        log(channelId, `ffmpeg exited (code=${code} signal=${signal}) after ${Math.round(elapsedMs / 1000)}s`);
+        if (neverCameUp) {
+          void markChannelError(channelId, `Live transcode failed to start: ${stderrTail.slice(-500) || `exit code ${code}`}`);
+        }
+        releaseHwSlotIfHeld();
+        unregisterOnce();
+        liveStats.delete(channelId);
+        handlers.onExit();
+      },
+      (err: Error) => {
+        // Stalled (hung hardware/driver init) or failed to spawn at all.
+        if (backend !== 'software') {
+          log(channelId, `⚠️  live encode (${backend}) stalled, falling back to software: ${err.message}`);
+          releaseHwSlotIfHeld();
+          const replacement = attempt('software');
+          handlers.onProcessReplaced(replacement);
+          return;
+        }
+        log(channelId, `❌ ffmpeg error: ${err.message}`);
+        void markChannelError(channelId, err.message);
+        releaseHwSlotIfHeld();
+        unregisterOnce();
+        liveStats.delete(channelId);
+        handlers.onExit();
+      }
+    );
+
+    return proc;
+  };
+
+  const backend = await resolveEncoderBackend();
+  return attempt(backend);
 }
 
 // ── Automatic poster capture ─────────────────────────────────────────────────

@@ -1,0 +1,38 @@
+# StreamVault systemd service
+#
+# Install:
+#   sudo cp deploy/streamvault.service /etc/systemd/system/streamvault.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now streamvault
+#
+# Check status / logs:
+#   sudo systemctl status streamvault
+#   sudo journalctl -u streamvault -f
+#
+# Edit WorkingDirectory/User below to match where you actually cloned the repo
+# and which user should own/run it (don't run as root).
+
+[Unit]
+Description=StreamVault
+After=network.target mysql.service
+Wants=mysql.service
+
+[Service]
+Type=simple
+# Change these two to match your deployment:
+User=www-data
+WorkingDirectory=/var/www/streamvault/server
+
+ExecStart=/usr/bin/node dist/index.js
+Restart=on-failure
+RestartSec=5
+Environment=NODE_ENV=production
+
+# Optional: without this, the live-encoder's OS-priority boost for live ffmpeg
+# processes (os.setPriority -> ABOVE_NORMAL) silently no-ops when running as a
+# non-root user, since raising a process's scheduling priority on Linux
+# normally requires CAP_SYS_NICE or root. Uncomment to actually grant it:
+# AmbientCapabilities=CAP_SYS_NICE
+
+[Install]
+WantedBy=multi-user.target

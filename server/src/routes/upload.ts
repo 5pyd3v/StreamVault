@@ -103,12 +103,14 @@ router.post('/init', protect, requireAdmin, async (req: AuthRequest, res) => {
 
     res.json({ uploadId, totalChunks, chunkSize: CHUNK_SIZE });
   } catch (err: any) {
+    console.error('[upload:init] failed:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
 // ── Upload single chunk ───────────────────────────────────────────────────────
 router.post('/chunk', protect, requireAdmin, upload.single('chunk'), async (req: AuthRequest, res) => {
+  console.log(`[upload:chunk] uploadId=${req.body.uploadId} chunkIndex=${req.body.chunkIndex} file=${req.file ? `${req.file.size}b @ ${req.file.path}` : 'MISSING'}`);
   try {
     const { uploadId, chunkIndex, totalChunks, hash } = req.body;
     if (!uploadId || chunkIndex === undefined || !req.file) {
@@ -149,6 +151,7 @@ router.post('/chunk', protect, requireAdmin, upload.single('chunk'), async (req:
       complete: received >= total,
     });
   } catch (err: any) {
+    console.error(`[upload:chunk] failed for uploadId=${req.body.uploadId} chunkIndex=${req.body.chunkIndex}:`, err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -239,6 +242,7 @@ router.post('/merge', protect, requireAdmin, async (req: AuthRequest, res) => {
 
     res.json({ videoId: String(video.id), message: 'Merge complete, encoding started' });
   } catch (err: any) {
+    console.error(`[upload:merge] failed for uploadId=${req.body.uploadId}:`, err);
     res.status(500).json({ error: err.message });
   }
 });

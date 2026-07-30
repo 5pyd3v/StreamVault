@@ -6,6 +6,11 @@ import { countActiveSessions, deleteStaleSessions } from '../db/uploadSessions.j
 import { pool } from '../db/pool.js';
 import type { RowDataPacket } from 'mysql2';
 import { protect, requireAdmin, AuthRequest } from '../middleware/auth.js';
+import { listActiveChannelIds } from '../services/liveMediaServer.js';
+import { getLiveTranscodeStats } from '../services/liveEncoder.js';
+import { getViewerCount } from '../socket/handlers.js';
+import { schedulerStatus } from '../services/resourceScheduler.js';
+import { findChannelById } from '../db/liveChannels.js';
 
 const router = express.Router();
 
@@ -67,6 +72,32 @@ router.get('/stats', async (_req, res) => {
       failedJobs: stats.byStatus['failed'] || 0,
       encodingJobs: stats.byStatus['encoding'] || 0,
     });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Live + resource-scheduler diagnostics ─────────────────────────────────────
+router.get('/live-metrics', async (_req, res) => {
+  try {
+    const channelIds = listActiveChannelIds();
+    const channels = await Promise.all(channelIds.map(async (channelId) => {
+      const stats = getLiveTranscodeStats(channelId);
+      const channel = await findChannelById(channelId).catch(() => null);
+      return {
+        channelId,
+        slug: channel?.slug ?? null,
+        name: channel?.name ?? null,
+        backend: stats?.backend ?? null,
+        pid: stats?.pid ?? null,
+        uptimeSec: stats ? Math.round((Date.now() - stats.startedAt) / 1000) : null,
+        lastFps: stats?.lastFps ?? null,
+        lastSpeed: stats?.lastSpeed ?? null,
+        lastProgressAgoSec: stats?.lastProgressAt ? Math.round((Date.now() - stats.lastProgressAt) / 1000) : null,
+        viewerCount: getViewerCount(channelId),
+      };
+    }));
+    res.json({ channels, scheduler: schedulerStatus() });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }

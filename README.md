@@ -28,6 +28,8 @@
   <a href="#under-the-hood"><kbd>&nbsp;&nbsp;How it works&nbsp;&nbsp;</kbd></a>
   &nbsp;
   <a href="#the-stack"><kbd>&nbsp;&nbsp;Stack&nbsp;&nbsp;</kbd></a>
+  &nbsp;
+  <a href="#production-deployment"><kbd>&nbsp;&nbsp;Deploy&nbsp;&nbsp;</kbd></a>
 </p>
 
 </div>
@@ -101,15 +103,22 @@ socket-pushed progress.</sub>
 
 ```bash
 git clone https://github.com/you/streamvault.git && cd streamvault
-pnpm install
-cp server/.env.example server/.env    # set MONGO_URI, JWT_SECRET
-pnpm --filter streamvault-server dev  # :5000
-pnpm dev                              # :5173
+npm install && npm run build            # frontend
+cd server && npm install && npm run build && cd ..
+
+cp server/.env.example server/.env      # set DB_*, JWT_SECRET, JWT_REFRESH_SECRET
+mysql -u root -p -e "CREATE DATABASE streamvault"
+mysql -u root -p streamvault < server/schema.sql
+
+cd server && npm run dev                # :5000
+npm run dev                             # :5173 (separate terminal, project root)
 ```
 
 <sub>
-Requires Node <b>&ge;&nbsp;20</b>, MongoDB <b>&ge;&nbsp;6</b>, and <code>ffmpeg</code> / <code>ffprobe</code> on <code>$PATH</code>.
+Requires Node <b>&ge;&nbsp;20</b>, MySQL <b>&ge;&nbsp;8</b>, and <code>ffmpeg</code> / <code>ffprobe</code> on <code>$PATH</code>.
 The <b>first registered user is auto-promoted to admin</b> — register that account before opening signup to the public.
+Deploying to a real server instead of running locally? See <a href="#production-deployment">Production Deployment</a> below —
+<code>deploy/setup.sh</code> automates everything above.
 </sub>
 
 <br>
@@ -119,7 +128,7 @@ The <b>first registered user is auto-promoted to admin</b> — register that acc
 ```mermaid
 flowchart LR
     A[Client] -->|/init /chunk /merge| B[Upload API]
-    B -->|persist| C[(MongoDB<br/>UploadSession)]
+    B -->|persist| C[(MySQL<br/>upload_sessions)]
     B -->|source ready| D[Encoder Queue]
     D -->|fluent-ffmpeg| E[Renditions<br/>360 / 480 / 720 / 1080]
     E --> F[HLS Segmenter<br/>hls_time 6]
@@ -186,9 +195,12 @@ GET    /api/storage/stats            POST   /api/admin/cleanup
 <td>
 
 - **Express `4.18`** &middot; **TypeScript `5.3`** &middot; **tsx**
-- **mongoose `8`** &mdash; users, videos, sessions
-- **socket.io `4.6`** &mdash; JWT-auth'd handshake
+- **mysql2** &mdash; plain parameterized SQL, no ORM (`server/schema.sql`)
+- **socket.io `4.6`** &mdash; JWT-auth'd handshake, live channel + encoding events
+- **node-media-server** &mdash; RTMP ingest for OBS live streaming
 - **fluent-ffmpeg `2.1`** &middot; **multer `1.4`**
+- Hardware-accelerated encoding (NVENC/QSV/AMF/VideoToolbox) with automatic
+  software fallback, resource-aware VOD/live scheduling
 - **jsonwebtoken 9** &middot; **bcryptjs** (cost 12)
 - **helmet** &middot; **express-rate-limit** (20 / 15m auth)
 
@@ -204,17 +216,24 @@ All server config lives in `server/.env`. Defaults are shipped in code; only ove
 
 | Variable                    | Default                                | Purpose                                                     |
 | --------------------------- | -------------------------------------- | ----------------------------------------------------------- |
-| `PORT`                      | `5000`                                 | HTTP + socket.io listener                                   |
-| `MONGO_URI`                 | `mongodb://localhost:27017/streamvault` | Mongoose connection string                                  |
-| `JWT_SECRET`                | *required*                             | Signing secret for access tokens                            |
+| `PORT`                      | `5000`                                 | HTTP + socket.io listener (also serves the built frontend and `/uploads` in production) |
+| `CLIENT_URL`                | `http://localhost:5173`                | CORS origin for API/socket.io -- set to your real domain in production |
+| `DB_HOST` / `DB_PORT` / `DB_USER` / `DB_PASSWORD` / `DB_NAME` | `localhost` / `3306` / `root` / *(empty)* / `streamvault` | MySQL connection (`mysql2` pool) |
+| `JWT_SECRET` / `JWT_REFRESH_SECRET` | *required*                      | Signing secrets for access/refresh tokens                   |
 | `JWT_EXPIRES_IN`            | `7d`                                   | Access token lifetime                                       |
 | `JWT_REFRESH_EXPIRES_IN`    | `30d`                                  | Refresh token lifetime                                      |
 | `CHUNK_SIZE_MB`             | `5`                                    | Upload chunk size negotiated at `/init`                     |
 | `MAX_FILE_SIZE_GB`          | `100`                                  | Hard ceiling per upload session                             |
-| `MAX_CONCURRENT_JOBS`       | `4`                                    | Encoder slot queue depth                                    |
+| `MAX_CONCURRENT_JOBS`       | `4`                                    | VOD encoder concurrency ceiling when no live broadcast is active |
+| `MAX_CONCURRENT_JOBS_WHILE_LIVE` | `1`                                | VOD encoder ceiling while at least one channel is live       |
+| `ENCODER_HWACCEL`           | `auto`                                 | `auto` \| `nvenc` \| `qsv` \| `amf` \| `videotoolbox` \| `software` |
 | `FFMPEG_PATH` / `FFPROBE_PATH` | *auto*                              | Override if binaries are not on `$PATH`                     |
 | `STORAGE_PROVIDER`          | `local`                                | Reported in `/api/storage/stats`                            |
-| `STORAGE_LOCAL_PATH`        | `server/uploads`                       | Root for `temp/`, `videos/`, `thumbnails/`, `hls/`          |
+| `STORAGE_LOCAL_PATH`        | `server/uploads`                       | Root for `temp/`, `videos/`, `thumbnails/`, `hls/`, `recordings/`, `posters/` |
+| `RTMP_PORT` / `PUBLIC_RTMP_HOST` | `1935` / `localhost`              | OBS RTMP ingest port and the host streamers put in OBS's "Server" field -- **must be your public IP/domain in production, not `localhost`** |
+| `LIVE_HLS_SEGMENT_TIME` / `LIVE_HLS_DVR_SECONDS` | `2` / `180`         | Live HLS segment duration and rewind window                 |
+
+Full list with detailed comments, including every hardware-encoding and resource-scheduling knob, lives in `server/.env.example`.
 
 <br>
 
@@ -230,6 +249,31 @@ uploads/
         ├── 360p/  480p/  720p/  1080p/
         └── master.m3u8
 ```
+
+<br>
+
+## <a id="production-deployment"></a><sub>&#9679;&nbsp;&nbsp;P R O D U C T I O N &nbsp; D E P L O Y M E N T</sub>
+
+One Node process serves the built frontend, the REST API, `/uploads`, and Socket.IO all on a single port (the frontend already only ever calls relative `/api` and connects `socket.io` to `/`, so this isn't a workaround — it's the shape the app is already built for). A reverse proxy in front of it, if you use one, only has to forward the whole domain to that one port.
+
+```bash
+git clone <your-repo-url> /var/www/streamvault && cd /var/www/streamvault
+bash deploy/setup.sh
+```
+
+`deploy/setup.sh` checks for Node/ffmpeg/MySQL, installs and builds the frontend and backend, creates `server/.env` from the example file (only if one doesn't already exist), and creates the full `uploads/` directory tree. It prints the remaining manual steps at the end:
+
+1. **Edit `server/.env`** — at minimum `DB_*`, `JWT_SECRET`/`JWT_REFRESH_SECRET`, `CLIENT_URL` (your real domain), and `PUBLIC_RTMP_HOST` (your VPS's public IP/domain, **not** `localhost`, if you'll use live streaming).
+2. **Create the database and import the schema** (once): `mysql -u <user> -p streamvault < server/schema.sql`, after `CREATE DATABASE streamvault`.
+3. **Install the systemd service** so the app survives crashes and reboots:
+   ```bash
+   sudo cp deploy/streamvault.service /etc/systemd/system/streamvault.service
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now streamvault
+   sudo journalctl -u streamvault -f   # tail logs
+   ```
+4. **Reverse proxy (optional)** — not sure what's already running on this VPS? `sudo ss -tlnp | grep -E ':80|:443'` tells you. If something's there, `deploy/apache-streamvault.conf` and `deploy/nginx-streamvault.conf` are ready-to-copy configs for each (WebSocket upgrade for Socket.IO, unlimited body size so chunked uploads aren't rejected before reaching Node, and a note on `mod_security` if Apache blocks large uploads by default). If nothing's listening on 80/443, this step is entirely optional — the app already works on its own port from step 3.
+5. **Open port 1935** for OBS/RTMP live streaming: `sudo ufw allow 1935/tcp` (or your firewall/security group's equivalent). This port is never proxied — OBS connects to it directly.
 
 <br>
 

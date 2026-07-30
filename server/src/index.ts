@@ -43,6 +43,12 @@ if (process.env.UPLOAD_TEMP_PATH) {
 const app = express();
 const httpServer = createServer(app);
 
+// Needed behind any reverse proxy (Apache/nginx) so express-rate-limit and
+// req.ip see the real client IP from X-Forwarded-For instead of the proxy's
+// own address -- without this every visitor shares one rate-limit bucket.
+// Harmless with no proxy in front (dev, or a bare VPS with nothing on :80).
+app.set('trust proxy', 1);
+
 export const io = new Server(httpServer, {
   cors: { origin: process.env.CLIENT_URL || 'http://localhost:5173', credentials: true },
 });
@@ -84,6 +90,29 @@ app.use('/api/live',     liveRoutes);
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
+
+// ── Built frontend (production) ──────────────────────────────────────────────
+// The frontend already assumes same-origin deployment (src/lib/api.ts's BASE
+// is the relative '/api', src/lib/socket.ts connects to io("/")) -- so in
+// production this one Node process serves the built React app, the API, and
+// Socket.IO all on one port, and a reverse proxy (if any) just forwards the
+// whole domain here. `npm run build` at the project root produces this dist/
+// folder; it won't exist yet in plain `npm run dev`, so everything below is a
+// no-op until it does.
+const CLIENT_DIST = path.join(__dirname, '..', '..', 'dist');
+if (fs.existsSync(CLIENT_DIST)) {
+  app.use(express.static(CLIENT_DIST));
+  // Anything that isn't an API/uploads/socket.io route and isn't a real static
+  // file falls through to index.html so React Router can handle it client-side
+  // (e.g. a hard refresh on /library). A typo'd or missing /api or /uploads
+  // path should 404 as JSON, not silently return the HTML shell.
+  app.get('*', (req, res) => {
+    if (req.path.startsWith('/api/') || req.path.startsWith('/uploads/')) {
+      return res.status(404).json({ error: 'Not found' });
+    }
+    res.sendFile(path.join(CLIENT_DIST, 'index.html'));
+  });
+}
 
 app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   console.error(err.stack);
