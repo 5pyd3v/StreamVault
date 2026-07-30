@@ -256,6 +256,8 @@ uploads/
 
 One Node process serves the built frontend, the REST API, `/uploads`, and Socket.IO all on a single port (the frontend already only ever calls relative `/api` and connects `socket.io` to `/`, so this isn't a workaround — it's the shape the app is already built for). A reverse proxy in front of it, if you use one, only has to forward the whole domain to that one port.
 
+The condensed steps are below; **[`deploy/VPS_SETUP.md`](deploy/VPS_SETUP.md) is the full walkthrough** with a checkpoint after every phase and a troubleshooting table for the specific failures this setup tends to hit (case-sensitive systemd paths, uploads silently not reaching Node, a `git pull` that didn't actually fetch anything).
+
 ```bash
 git clone <your-repo-url> /var/www/streamvault && cd /var/www/streamvault
 bash deploy/setup.sh
