@@ -55,7 +55,23 @@ export const io = new Server(httpServer, {
 
 registerSocketHandlers(io);
 
-app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+  // Helmet's default CSP includes `upgrade-insecure-requests`, which tells
+  // the browser to force every asset request to https:// -- fine behind a
+  // real TLS-terminating reverse proxy, but actively breaks the app when
+  // accessed over plain http:// (e.g. directly by IP, before a domain/
+  // certificate is set up): the browser tries to upgrade the CSS/JS requests
+  // to https on a port with no TLS listener and they fail outright (blank
+  // page). This app doesn't otherwise rely on a strict CSP, so it's simplest
+  // to just turn it off rather than maintain two different helmet configs
+  // for "behind HTTPS" vs "plain HTTP" deployments.
+  contentSecurityPolicy: false,
+  // Same reasoning: these two headers are inert (browser-ignored, console
+  // warning only) without HTTPS, so there's no reason to send them here.
+  crossOriginOpenerPolicy: false,
+  originAgentCluster: false,
+}));
 app.use(cors({ origin: process.env.CLIENT_URL || 'http://localhost:5173', credentials: true }));
 app.use(morgan('dev'));
 app.use(express.json({ limit: '1mb' }));
